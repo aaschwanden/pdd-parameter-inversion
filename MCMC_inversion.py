@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import PDD
 import theano
 import warnings
 import numpy as np
@@ -383,17 +382,18 @@ class TTPDDModel(object):
         inst_pdd = self.inst_pdd(temp, stdv)
 
         # initialize snow depth, melt and refreeze rates
-        snow_depth = np.zeros_like(temp)
-        snow_melt_rate = np.zeros_like(temp)
-        ice_melt_rate = np.zeros_like(temp)
-        snow_refreeze_rate = np.zeros_like(temp)
-        ice_refreeze_rate = np.zeros_like(temp)
+        snow_depth = theano.shared(np.zeros_like(temp))
+        snow_melt_rate = theano.shared(np.zeros_like(temp))
+        ice_melt_rate = theano.shared(np.zeros_like(temp))
+        snow_refreeze_rate = theano.shared(np.zeros_like(temp))
+        ice_refreeze_rate = theano.shared(np.zeros_like(temp))
 
         # compute snow depth and melt rates
         for i in range(len(temp)):
             if i > 0:
                 snow_depth[i] = snow_depth[i - 1]
             snow_depth[i] += accu_rate[i]
+            print(snow_depth, inst_pdd)
             snow_melt_rate[i], ice_melt_rate[i] = self.melt_rates(
                 snow_depth[i], inst_pdd[i]
             )
@@ -487,7 +487,7 @@ class TTPDDModel(object):
         ) + temp / 2 * sp.erfc(-normtemp)
 
         # use positive part where sigma is zero and Calov and Greve elsewhere
-        teff = np.where(stdv == 0.0, positivepart, calovgreve)
+        teff = tt.where(stdv == 0.0, positivepart, calovgreve)
 
         # convert to degree-days
         return teff * 365.242198781
@@ -533,7 +533,7 @@ class TTPDDModel(object):
         pot_snow_melt = ddf_snow * pdd
 
         # effective snow melt can't exceed amount of snow
-        snow_melt = np.minimum(snow, pot_snow_melt)
+        snow_melt = tt.minimum(snow, pot_snow_melt)
 
         # ice melt is proportional to excess snow melt
         ice_melt = (pot_snow_melt - snow_melt) * ddf_ice / ddf_snow
@@ -570,7 +570,7 @@ class PDD_MCMC:
                 of the mass balance model [m i.e yr^-1]
         """
 
-        pdd_model = PDDModel(
+        pdd_model = TTPDDModel(
             pdd_factor_snow=f_snow,
             pdd_factor_ice=f_ice,
             refreeze_snow=f_refreeze,
@@ -583,51 +583,27 @@ class PDD_MCMC:
         M = result["melt_rate"]
         R = result["refreeze_rate"]
 
-        # # temperature and PDDs calc
-        # T      = self._air_temp(z)
-        # PDDs   = tt.switch(tt.gt(T, self.T_m), T, 0.0).sum(axis=0)
-
-        # # # accumulation calc
-        # # A_snow = self.__tt_accumulation(z, grad_a, T)
-
-        # A_days = tt.switch(tt.lt(T, self.T_rs), 1/365., 0.0).sum(axis=0)
-        # A_snow = tt.maximum((A_days*A_mean)*(1+(z-self.ref_z)*grad_a), 0.0)
-
-        # # calculate local surface melt assuming f_m = f_snow
-        # melt_local = PDDs * f_snow
-
-        # # calculate refreezing
-        # R = tt.minimum(f_r*A_snow, melt_local)
-
-        # r_s2m = tt.switch(tt.eq(melt_local, 0.0), 1.0, A_snow/melt_local)
-
-        # f_m = tt.switch(tt.ge(r_s2m, 1.), f_snow,
-        #                 f_ice - (f_ice - f_snow)*r_s2m)
-
-        # # calculate surface melt [kg m^{-2} yr^{-1}] with f_m
-        # M_melt = f_m*PDDs
-
-        # # Return individual components of the mass balance model in [m i.e. / y]
         return R, A, M
 
 
-def read_observation(file="DMI-HIRHAM5_ERA_1980_EPSG3413_4500M_DM_PYDD.nc"):
+def read_observation(file="DMI-HIRHAM5_1980.nc"):
     """
     Read and return Obs
     """
 
     with xr.open_dataset(file) as Obs:
 
-        stacked = Obs.stack(z=("y", "x"))
+        stacked = Obs.stack(z=("rlat", "rlon"))
 
         temp = stacked.tas
-        rainfall = stacked.rainfall.values
-        snowfall = stacked.snowfall.values
-        smb = stacked.gld.values
-
+        rainfall = np.nan_to_num(stacked.rainfall.values, 0) / 1000
+        snowfall = np.nan_to_num(stacked.snfall.values, 0) / 1000
+        smb = np.nan_to_num(stacked.gld.values, 0) / 1000
+        refreeze = np.nan_to_num(stacked.rfrz.values, 0) / 1000
+        melt = np.nan_to_num(stacked.snmel.values, 0) / 1000
         precip = rainfall + snowfall
 
-    return temp, precip, smb
+    return temp, precip, smb, melt, refreeze
 
 
 def plot_posterior(trace, vars: list, out_fp: str):
@@ -713,7 +689,12 @@ def simultaneous_fit_LA(
     # Define Forward model (wrapped through theano)
     with model:
         R, A, M = PDD_forward.forward(
-            temp_obs, precip_obs, f_snow_prior, f_ice_prior, f_refreeze_prior
+            temp_obs,
+            precip_obs,
+            np.zeros_like(temp_obs),
+            f_snow_prior,
+            f_ice_prior,
+            f_refreeze_prior,
         )
         # net balance [m i.e. / yr ]
         B = A + R - M
@@ -777,16 +758,11 @@ def new_likelihood(z_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Mass balance Model (physical priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Degree Day factor: Braithwaite (2008) / Rounce et al. 2020
-        f_s_prior = pm.TruncatedNormal("f_s", mu=4.1, sigma=1.5, lower=0.0)
-        # Somewhat base of Aschwanden et al. 2019
-        C_prior = pm.TruncatedNormal("C", mu=2.0, sigma=0.75, lower=1)
-        # Need a reference for the accumulation grad distibution
-        grad_a = pm.Uniform("grad_a", lower=0.5e-4, upper=5e-4)
-        #
-        A_m_prior = pm.Normal("A_mean", mu=1300, sigma=100)
-        # Somewhat base of Aschwanden et al. 2019
-        f_r_prior = pm.TruncatedNormal("f_r", mu=0.5, sigma=0.2, lower=0.0, upper=1)
+        f_snow_prior = pm.TruncatedNormal("f_snow", mu=4.1, sigma=1.5, lower=0.0)
+        f_ice_prior = pm.TruncatedNormal("f_ice", mu=8.0, sigma=2.0, lower=0.0)
+        f_refreeze_prior = pm.TruncatedNormal(
+            "f_refreeze", mu=0.5, sigma=0.2, lower=0.0, upper=1
+        )
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Hyperparameters (likelihood related priors)
@@ -796,7 +772,12 @@ def new_likelihood(z_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1):
     # Define Forward model (wrapped through theano)
     with model:
         R, A, M = PDD_forward.forward(
-            z_obs, f_s_prior, C_prior, f_r_prior, grad_a, A_m_prior
+            temp_obs,
+            precip_obs,
+            np.zeros_like(temp_obs),
+            f_snow_prior,
+            f_ice_prior,
+            f_refreeze_prior,
         )
         # net balance [m i.e. / yr ]
         B = A + R - M
@@ -847,19 +828,19 @@ def run_LA(fit_type, draws=4000, tune=2000, cores=1):
         raise AssertionError("invalid fit type")
 
     # load observations
-    z_obs, R_obs, A_obs, M_obs, B_obs = read_observation()
+    temp_obs, precip_obs, smb_obs, melt_obs, refreeze_obs = read_observation()
 
     if simul:
         # fit the PWA model with MCMC
         model, trace, pp_R, pp_A, pp_M, pp_B = simultaneous_fit_LA(
-            z_obs, R_obs, A_obs, M_obs, draws, tune, cores
+            temp_obs, precip_obs, R_obs, A_obs, M_obs, draws, tune, cores
         )
     elif new:
         model, trace, pp_R, pp_A, pp_M, pp_B = new_likelihood(
-            z_obs, R_obs, A_obs, M_obs, draws, tune, cores
+            temp_obs, precip_obs, R_obs, A_obs, M_obs, draws, tune, cores
         )
     # plot the traces
-    vars = ["f_s", "C", "f_r", "grad_a", "A_mean"]
+    vars = ["f_snow", "f_ice", "f_refreeze"]
     out_fp = f"./result/new2/trace_LA_{fit_type}.png"
 
     plot_posterior(trace, vars=vars, out_fp=out_fp)
@@ -888,23 +869,9 @@ if __name__ == "__main__":
     cores = 1
 
     # load observations
-    z_obs, R_obs, A_obs, M_obs, B_obs = read_observation()
+    temp_obs, precip_obs, smb_obs, melt_obs, refreeze_obs = read_observation()
 
-    # dictionary of PDD model parameters
-    p = [8.29376332e-05, -3.45256005e-02, 6.31076200e00]
-    doy = np.arange(1, 366)
-    fancy_std = np.polyval(p, doy)[:, np.newaxis]
-
-    const = dict(
-        T_m=0.0,
-        T_rs=1.0,
-        α=10.8,
-        T_ma=-9.02,
-        ΔTΔz=6.5e-3,
-        T_p=196,
-        ref_z=2193,
-        T_σ=fancy_std,
-    )
+    const = dict()
 
     # initialize the PDD melt model class
     PDD_forward = PDD_MCMC(**const)
@@ -914,16 +881,11 @@ if __name__ == "__main__":
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Mass balance Model (physical priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Degree Day factor: Braithwaite (2008) / Rounce et al. 2020
-        f_s_prior = pm.TruncatedNormal("f_s", mu=4.1, sigma=1.5, lower=0.0)
-        # Somewhat base of Aschwanden et al. 2019
-        C_prior = pm.TruncatedNormal("C", mu=2.0, sigma=0.75, lower=1)
-        # Need a reference for the accumulation grad distibution
-        grad_a = pm.Uniform("grad_a", lower=0.5e-4, upper=5e-4)
-        #
-        A_m_prior = pm.Normal("A_mean", mu=1300, sigma=100)
-        # Somewhat base of Aschwanden et al. 2019
-        f_r_prior = pm.TruncatedNormal("f_r", mu=0.5, sigma=0.2, lower=0.0, upper=1)
+        f_snow_prior = pm.TruncatedNormal("f_snow", mu=4.1, sigma=1.5, lower=0.0)
+        f_ice_prior = pm.TruncatedNormal("f_ice", mu=8.0, sigma=2.0, lower=0.0)
+        f_refreeze_prior = pm.TruncatedNormal(
+            "f_refreeze", mu=0.5, sigma=0.2, lower=0.0, upper=1
+        )
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Hyperparameters (likelihood related priors)
@@ -933,7 +895,12 @@ if __name__ == "__main__":
     # Define Forward model (wrapped through theano)
     with model:
         R, A, M = PDD_forward.forward(
-            z_obs, f_s_prior, C_prior, f_r_prior, grad_a, A_m_prior
+            temp_obs,
+            precip_obs,
+            np.zeros_like(temp_obs),
+            f_snow_prior,
+            f_ice_prior,
+            f_refreeze_prior,
         )
         # net balance [m i.e. / yr ]
         B = A + R - M
