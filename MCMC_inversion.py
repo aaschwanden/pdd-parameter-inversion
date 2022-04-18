@@ -391,13 +391,13 @@ class TTPDDModel(object):
         # compute snow depth and melt rates
         for i in range(len(temp)):
             if i > 0:
-                snow_depth[i] = snow_depth[i - 1]
-            snow_depth[i] += accu_rate[i]
-            print(snow_depth, inst_pdd)
-            snow_melt_rate[i], ice_melt_rate[i] = self.melt_rates(
-                snow_depth[i], inst_pdd[i]
-            )
-            snow_depth[i] -= snow_melt_rate[i]
+                tt.set_subtensor(snow_depth[i], snow_depth[i - 1])
+            tt.set_subtensor(snow_depth[i], snow_depth[i] + accu_rate[i])
+            smr, imr = self.melt_rates(snow_depth[i], inst_pdd[i])
+            tt.set_subtensor(snow_melt_rate[i], smr)
+            tt.set_subtensor(ice_melt_rate[i], imr)
+            tt.set_subtensor(snow_depth[i], snow_depth[i] - snow_melt_rate[i])
+
         melt_rate = snow_melt_rate + ice_melt_rate
         snow_refreeze_rate = self.refreeze_snow * snow_melt_rate
         ice_refreeze_rate = self.refreeze_ice * ice_melt_rate
@@ -427,6 +427,7 @@ class TTPDDModel(object):
             "ice_melt": self._integrate(ice_melt_rate),
             "melt": self._integrate(melt_rate),
             "runoff": self._integrate(runoff_rate),
+            "refreeze": self._integrate(refreeze_rate),
             "smb": self._integrate(inst_smb),
         }
 
@@ -448,7 +449,7 @@ class TTPDDModel(object):
 
     def _integrate(self, array):
         """Integrate an array over one year"""
-        return np.sum(array, axis=0) / (self.interpolate_n - 1)
+        return tt.sum(array, axis=0) / (self.interpolate_n - 1)
 
     def _interpolate(self, array):
         """Interpolate an array through one year."""
@@ -579,9 +580,9 @@ class PDD_MCMC:
 
         result = pdd_model(temp, precip, std_dev)
 
-        A = result["accu_rate"]
-        M = result["melt_rate"]
-        R = result["refreeze_rate"]
+        A = result["accu"]
+        M = result["melt"]
+        R = result["refreeze"]
 
         return R, A, M
 
@@ -603,7 +604,14 @@ def read_observation(file="DMI-HIRHAM5_1980.nc"):
         melt = np.nan_to_num(stacked.snmel.values, 0) / 1000
         precip = rainfall + snowfall
 
-    return temp, precip, smb, melt, refreeze
+    return (
+        temp,
+        precip,
+        smb.sum(axis=0),
+        refreeze.sum(axis=0),
+        snowfall.sum(axis=0),
+        refreeze.sum(axis=0),
+    )
 
 
 def plot_posterior(trace, vars: list, out_fp: str):
@@ -659,7 +667,7 @@ def plot_BAMR(z: np.ndarray, ppc: tuple, obs: tuple, out_fp: str, axis_labels=No
 
 
 def simultaneous_fit_LA(
-    temp_obs, precip_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1
+    T_obs, P_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1
 ):
     """Simultaneous fitting the linear accumulation model"""
 
@@ -684,14 +692,15 @@ def simultaneous_fit_LA(
         # ----> Hyperparameters (likelihood related priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         R_sigma = pm.HalfCauchy("R_sigma", 0.5)
+        A_sigma = pm.HalfCauchy("A_sigma", 2)
         M_sigma = pm.HalfCauchy("M_sigma", 5)
 
     # Define Forward model (wrapped through theano)
     with model:
         R, A, M = PDD_forward.forward(
-            temp_obs,
-            precip_obs,
-            np.zeros_like(temp_obs),
+            T_obs,
+            P_obs,
+            np.zeros_like(T_obs),
             f_snow_prior,
             f_ice_prior,
             f_refreeze_prior,
@@ -703,9 +712,10 @@ def simultaneous_fit_LA(
     with model:
         # Individual likelihood functions for each component
         R_est = pm.Normal("R_est", mu=R, sigma=R_sigma, observed=R_obs)
+        A_est = pm.Normal("A_est", mu=A, sigma=A_sigma, observed=A_obs)
         M_est = pm.Normal("M_est", mu=M, sigma=M_sigma, observed=M_obs)
 
-        potential = pm.Potential("obs", R_est.sum() * M_est.sum())
+        potential = pm.Potential("obs", R_est.sum() * A_est.sum() * M_est.sum())
 
     # run inference: Sample
     with model:
@@ -731,7 +741,7 @@ def simultaneous_fit_LA(
     return model, trace, pp_R, pp_A, pp_M, pp_B
 
 
-def new_likelihood(z_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1):
+def new_likelihood(T_obs, P_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1):
     """Simultaneous fitting the linear accumulation model"""
 
     # dictionary of PDD model parameters
@@ -772,9 +782,9 @@ def new_likelihood(z_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1):
     # Define Forward model (wrapped through theano)
     with model:
         R, A, M = PDD_forward.forward(
-            temp_obs,
-            precip_obs,
-            np.zeros_like(temp_obs),
+            T_obs,
+            P_obs,
+            np.zeros_like(T_obs),
             f_snow_prior,
             f_ice_prior,
             f_refreeze_prior,
@@ -828,16 +838,16 @@ def run_LA(fit_type, draws=4000, tune=2000, cores=1):
         raise AssertionError("invalid fit type")
 
     # load observations
-    temp_obs, precip_obs, smb_obs, melt_obs, refreeze_obs = read_observation()
+    T_obs, P_obs, B_obs, R_obs, A_obs, M_obs = read_observation()
 
     if simul:
-        # fit the PWA model with MCMC
+        # fit the PDD model with MCMC
         model, trace, pp_R, pp_A, pp_M, pp_B = simultaneous_fit_LA(
-            temp_obs, precip_obs, R_obs, A_obs, M_obs, draws, tune, cores
+            T_obs, P_obs, B_obs, R_obs, A_obs, M_obs, draws, tune, cores
         )
     elif new:
         model, trace, pp_R, pp_A, pp_M, pp_B = new_likelihood(
-            temp_obs, precip_obs, R_obs, A_obs, M_obs, draws, tune, cores
+            T_obs, P_obs, B_obs, R_obs, A_obs, M_obs, draws, tune, cores
         )
     # plot the traces
     vars = ["f_snow", "f_ice", "f_refreeze"]
@@ -869,7 +879,7 @@ if __name__ == "__main__":
     cores = 1
 
     # load observations
-    temp_obs, precip_obs, smb_obs, melt_obs, refreeze_obs = read_observation()
+    T_obs, P_obs, B_obs, R_obs, A_obs, M_obs = read_observation()
 
     const = dict()
 
@@ -895,9 +905,9 @@ if __name__ == "__main__":
     # Define Forward model (wrapped through theano)
     with model:
         R, A, M = PDD_forward.forward(
-            temp_obs,
-            precip_obs,
-            np.zeros_like(temp_obs),
+            T_obs,
+            P_obs,
+            np.zeros_like(T_obs),
             f_snow_prior,
             f_ice_prior,
             f_refreeze_prior,
@@ -905,7 +915,18 @@ if __name__ == "__main__":
         # net balance [m i.e. / yr ]
         B = A + R - M
 
-        mu = tt.as_tensor_variable([R, A, M])
+        # mu = [
+        #     R,
+        #     A,
+        #     M,
+        # ]
+        mu = tt.as_tensor_variable(
+            [
+                R.eval(),
+                A.eval(),
+                M.eval(),
+            ]
+        )
 
     # Define likelihood (function?)
     with model:
@@ -914,7 +935,9 @@ if __name__ == "__main__":
             "est",
             mu=tt.log(mu.var()),
             sigma=sigma,
-            observed=theano.shared([R_obs, A_obs, M_obs]),
+            observed=theano.shared(
+                [R_obs.reshape(-1, 1), A_obs.reshape(-1, 1), M_obs.reshape(-1, 1)]
+            ),
         )
 
         # potential = pm.Potential("obs", R_est.sum()*A_est.sum()*M_est.sum())
