@@ -382,6 +382,11 @@ class TTPDDModel(object):
         inst_pdd = self.inst_pdd(temp, stdv)
 
         # initialize snow depth, melt and refreeze rates
+        snow_depth = np.zeros_like(temp)
+        snow_melt_rate = np.zeros_like(temp)
+        ice_melt_rate = np.zeros_like(temp)
+        snow_refreeze_rate = np.zeros_like(temp)
+        ice_refreeze_rate = np.zeros_like(temp)
         snow_depth = theano.shared(np.zeros_like(temp))
         snow_melt_rate = theano.shared(np.zeros_like(temp))
         ice_melt_rate = theano.shared(np.zeros_like(temp))
@@ -397,6 +402,18 @@ class TTPDDModel(object):
             tt.set_subtensor(snow_melt_rate[i], smr)
             tt.set_subtensor(ice_melt_rate[i], imr)
             tt.set_subtensor(snow_depth[i], snow_depth[i] - snow_melt_rate[i])
+        # # compute snow depth and melt rates
+        # print(snow_depth, accu_rate)
+        # for i in range(len(temp)):
+        #     if i > 0:
+        #         snow_depth[i] = snow_depth[i - 1]
+        #     snow_depth[i] += accu_rate[i]
+        #     smr, imr = self.melt_rates(snow_depth[i], inst_pdd[i])
+        #     print(snow_depth, inst_pdd)
+        #     snow_melt_rate[i], ice_melt_rate[i] = self.melt_rates(
+        #         snow_depth[i], inst_pdd[i]
+        #     )
+        #     snow_depth[i] -= snow_melt_rate[i]
 
         melt_rate = snow_melt_rate + ice_melt_rate
         snow_refreeze_rate = self.refreeze_snow * snow_melt_rate
@@ -475,17 +492,16 @@ class TTPDDModel(object):
         *stdv*: array_like
             Standard deviation of near-surface air temperature in Kelvin.
         """
-        import scipy.special as sp
 
         # compute positive part of temperature everywhere
-        positivepart = np.greater(temp, 0) * temp
+        positivepart = tt.gt(temp, 0) * temp
 
         # compute Calov and Greve (2005) integrand, ignoring division by zero
         with np.errstate(divide="ignore", invalid="ignore"):
             normtemp = temp / (np.sqrt(2) * stdv)
-        calovgreve = stdv / np.sqrt(2 * np.pi) * np.exp(
+        calovgreve = stdv / np.sqrt(2 * np.pi) * tt.exp(
             -(normtemp**2)
-        ) + temp / 2 * sp.erfc(-normtemp)
+        ) + temp / 2 * tt.erfc(-normtemp)
 
         # use positive part where sigma is zero and Calov and Greve elsewhere
         teff = tt.where(stdv == 0.0, positivepart, calovgreve)
@@ -508,7 +524,7 @@ class TTPDDModel(object):
 
         # compute snow fraction as a function of temperature
         reduced_temp = (self.temp_rain - temp) / (self.temp_rain - self.temp_snow)
-        snowfrac = np.clip(reduced_temp, 0, 1)
+        snowfrac = tt.clip(reduced_temp, 0, 1)
 
         # return accumulation rate
         return snowfrac * prec
@@ -922,9 +938,9 @@ if __name__ == "__main__":
         # ]
         mu = tt.as_tensor_variable(
             [
-                R.eval(),
-                A.eval(),
-                M.eval(),
+                R,
+                A,
+                M,
             ]
         )
 
