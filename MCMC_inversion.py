@@ -135,6 +135,7 @@ class PDDModel(object):
                 snow_depth[i], inst_pdd[i]
             )
             snow_depth[i] -= snow_melt_rate[i]
+
         melt_rate = snow_melt_rate + ice_melt_rate
         snow_refreeze_rate = self.refreeze_snow * snow_melt_rate
         ice_refreeze_rate = self.refreeze_ice * ice_melt_rate
@@ -164,6 +165,7 @@ class PDDModel(object):
             "ice_melt": self._integrate(ice_melt_rate),
             "melt": self._integrate(melt_rate),
             "runoff": self._integrate(runoff_rate),
+            "refreeze": self._integrate(refreeze_rate),
             "smb": self._integrate(inst_smb),
         }
 
@@ -402,18 +404,6 @@ class TTPDDModel(object):
             tt.set_subtensor(snow_melt_rate[i], smr)
             tt.set_subtensor(ice_melt_rate[i], imr)
             tt.set_subtensor(snow_depth[i], snow_depth[i] - snow_melt_rate[i])
-        # # compute snow depth and melt rates
-        # print(snow_depth, accu_rate)
-        # for i in range(len(temp)):
-        #     if i > 0:
-        #         snow_depth[i] = snow_depth[i - 1]
-        #     snow_depth[i] += accu_rate[i]
-        #     smr, imr = self.melt_rates(snow_depth[i], inst_pdd[i])
-        #     print(snow_depth, inst_pdd)
-        #     snow_melt_rate[i], ice_melt_rate[i] = self.melt_rates(
-        #         snow_depth[i], inst_pdd[i]
-        #     )
-        #     snow_depth[i] -= snow_melt_rate[i]
 
         melt_rate = snow_melt_rate + ice_melt_rate
         snow_refreeze_rate = self.refreeze_snow * snow_melt_rate
@@ -612,7 +602,7 @@ def read_observation(file="DMI-HIRHAM5_1980.nc"):
 
         stacked = Obs.stack(z=("rlat", "rlon"))
 
-        temp = stacked.tas
+        temp = np.nan_to_num(stacked.tas, 0)
         rainfall = np.nan_to_num(stacked.rainfall.values, 0) / 1000
         snowfall = np.nan_to_num(stacked.snfall.values, 0) / 1000
         smb = np.nan_to_num(stacked.gld.values, 0) / 1000
@@ -892,7 +882,7 @@ if __name__ == "__main__":
     fit_type = "new"
     draws = 2000
     tune = 2000
-    cores = 1
+    cores = 6
 
     # load observations
     T_obs, P_obs, B_obs, R_obs, A_obs, M_obs = read_observation()
@@ -916,7 +906,7 @@ if __name__ == "__main__":
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Hyperparameters (likelihood related priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        sigma = pm.HalfCauchy("R_sigma", 1, shape=3)
+        sigma = pm.HalfCauchy("R_sigma", 1, shape=4)
 
     # Define Forward model (wrapped through theano)
     with model:
@@ -931,16 +921,12 @@ if __name__ == "__main__":
         # net balance [m i.e. / yr ]
         B = A + R - M
 
-        # mu = [
-        #     R,
-        #     A,
-        #     M,
-        # ]
         mu = tt.as_tensor_variable(
             [
                 R,
                 A,
                 M,
+                B,
             ]
         )
 
@@ -949,10 +935,15 @@ if __name__ == "__main__":
         # Individual likelihood functions for each component
         est = pm.Normal(
             "est",
-            mu=tt.log(mu.var()),
+            mu=tt.log(tt.var(mu)),
             sigma=sigma,
-            observed=theano.shared(
-                [R_obs.reshape(-1, 1), A_obs.reshape(-1, 1), M_obs.reshape(-1, 1)]
+            observed=np.array(
+                [
+                    R_obs.reshape(-1, 1),
+                    A_obs.reshape(-1, 1),
+                    M_obs.reshape(-1, 1),
+                    B_obs.reshape(-1, 1),
+                ],
             ),
         )
 
