@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings(action="ignore")
 theano.config.compute_test_value = "warn"
-
+# theano.config.mode = "JAX"
 
 # PDD model class
 # ---------------
@@ -384,11 +384,6 @@ class TTPDDModel(object):
         inst_pdd = self.inst_pdd(temp, stdv)
 
         # initialize snow depth, melt and refreeze rates
-        snow_depth = np.zeros_like(temp)
-        snow_melt_rate = np.zeros_like(temp)
-        ice_melt_rate = np.zeros_like(temp)
-        snow_refreeze_rate = np.zeros_like(temp)
-        ice_refreeze_rate = np.zeros_like(temp)
         snow_depth = theano.shared(np.zeros_like(temp))
         snow_melt_rate = theano.shared(np.zeros_like(temp))
         ice_melt_rate = theano.shared(np.zeros_like(temp))
@@ -396,14 +391,15 @@ class TTPDDModel(object):
         ice_refreeze_rate = theano.shared(np.zeros_like(temp))
 
         # compute snow depth and melt rates
+
         for i in range(len(temp)):
             if i > 0:
-                tt.set_subtensor(snow_depth[i], snow_depth[i - 1])
-            tt.set_subtensor(snow_depth[i], snow_depth[i] + accu_rate[i])
+                snow_depth = tt.set_subtensor(snow_depth[i], snow_depth[i - 1])
+            snow_depth = tt.inc_subtensor(snow_depth[i], accu_rate[i])
             smr, imr = self.melt_rates(snow_depth[i], inst_pdd[i])
-            tt.set_subtensor(snow_melt_rate[i], smr)
-            tt.set_subtensor(ice_melt_rate[i], imr)
-            tt.set_subtensor(snow_depth[i], snow_depth[i] - snow_melt_rate[i])
+            snow_melt_rate = tt.set_subtensor(snow_melt_rate[i], smr[i])
+            ice_melt_rate = tt.set_subtensor(ice_melt_rate[i], imr[i])
+            snow_depth = tt.inc_subtensor(snow_depth[i], -snow_melt_rate[i])
 
         melt_rate = snow_melt_rate + ice_melt_rate
         snow_refreeze_rate = self.refreeze_snow * snow_melt_rate
@@ -601,13 +597,14 @@ def read_observation(file="DMI-HIRHAM5_1980.nc"):
     with xr.open_dataset(file) as Obs:
 
         stacked = Obs.stack(z=("rlat", "rlon"))
+        ncl_stacked = Obs.stack(z=("ncl4", "ncl5"))
 
-        temp = np.nan_to_num(stacked.tas, 0)
-        rainfall = np.nan_to_num(stacked.rainfall.values, 0) / 1000
-        snowfall = np.nan_to_num(stacked.snfall.values, 0) / 1000
-        smb = np.nan_to_num(stacked.gld.values, 0) / 1000
-        refreeze = np.nan_to_num(stacked.rfrz.values, 0) / 1000
-        melt = np.nan_to_num(stacked.snmel.values, 0) / 1000
+        temp = stacked.tas.dropna(dim="z").values
+        rainfall = stacked.rainfall.dropna(dim="z").values / 1000
+        snowfall = stacked.snfall.dropna(dim="z").values / 1000
+        smb = stacked.gld.dropna(dim="z").values / 1000
+        refreeze = ncl_stacked.rfrz.dropna(dim="z").values / 1000
+        melt = stacked.snmel.dropna(dim="z").values / 1000
         precip = rainfall + snowfall
 
     return (
@@ -673,7 +670,7 @@ def plot_BAMR(z: np.ndarray, ppc: tuple, obs: tuple, out_fp: str, axis_labels=No
 
 
 def simultaneous_fit_LA(
-    T_obs, P_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1
+    T_obs, P_obs, R_obs, A_obs, M_obs, B_obs, draws=4000, tune=2000, cores=1
 ):
     """Simultaneous fitting the linear accumulation model"""
 
@@ -723,48 +720,20 @@ def simultaneous_fit_LA(
 
         potential = pm.Potential("obs", R_est.sum() * A_est.sum() * M_est.sum())
 
-    # run inference: Sample
     with model:
-        trace = pm.sample(
-            init="adapt_diag",
-            draws=draws,
-            tune=tune,
-            cores=cores,
-            target_accept=0.9,
-            return_inferencedata=True,
+        approx = pm.fit(
+            draws, callbacks=[pm.callbacks.CheckParametersConvergence(tolerance=1e-4)]
         )
 
-    # do posterior predictive inference
-    with model:
-        ppc = pm.sample_posterior_predictive(
-            trace, var_names=["R_est", "A_est", "M_est"], keep_size=True
-        )
-        pp_R = ppc["R_est"]
-        pp_A = ppc["A_est"]
-        pp_M = ppc["M_est"]
-        pp_B = pp_A + pp_R - pp_M
-
-    return model, trace, pp_R, pp_A, pp_M, pp_B
+    return approx
 
 
-def new_likelihood(T_obs, P_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cores=1):
+def new_likelihood(
+    T_obs, P_obs, R_obs, A_obs, M_obs, B_obs, draws=4000, tune=2000, cores=1
+):
     """Simultaneous fitting the linear accumulation model"""
 
-    # dictionary of PDD model parameters
-    p = [8.29376332e-05, -3.45256005e-02, 6.31076200e00]
-    doy = np.arange(1, 366)
-    fancy_std = np.polyval(p, doy)[:, np.newaxis]
-
-    const = dict(
-        T_m=0.0,
-        T_rs=1.0,
-        α=10.8,
-        T_ma=-9.02,
-        ΔTΔz=6.5e-3,
-        T_p=196,
-        ref_z=2193,
-        T_σ=fancy_std,
-    )
+    const = dict()
 
     # initialize the PDD melt model class
     PDD_forward = PDD_MCMC(**const)
@@ -808,28 +777,12 @@ def new_likelihood(T_obs, P_obs, R_obs, A_obs, M_obs, draws=4000, tune=2000, cor
             observed=theano.shared([R_obs, A_obs, M_obs]),
         )
 
-        # potential = pm.Potential("obs", R_est.sum()*A_est.sum()*M_est.sum())
-
-    # run inference: Sample
     with model:
-        trace = pm.sample(
-            init="adapt_diag",
-            draws=draws,
-            tune=tune,
-            cores=cores,
-            target_accept=0.9,
-            return_inferencedata=True,
+        approx = pm.fit(
+            draws, callbacks=[pm.callbacks.CheckParametersConvergence(tolerance=1e-4)]
         )
 
-    # do posterior predictive inference
-    with model:
-        ppc = pm.sample_posterior_predictive(trace, var_names=["est"], keep_size=True)
-        pp_R = ppc[0]
-        pp_A = ppc[1]
-        pp_M = ppc[2]
-        pp_B = pp_A + pp_R - pp_M
-
-    return model, trace, pp_R, pp_A, pp_M, pp_B
+    return approx
 
 
 def run_LA(fit_type, draws=4000, tune=2000, cores=1):
@@ -844,16 +797,16 @@ def run_LA(fit_type, draws=4000, tune=2000, cores=1):
         raise AssertionError("invalid fit type")
 
     # load observations
-    T_obs, P_obs, B_obs, R_obs, A_obs, M_obs = read_observation()
+    T_obs, P_obs, B_obs, R_obs, A_obs, M_obs, B_obs = read_observation()
 
     if simul:
         # fit the PDD model with MCMC
         model, trace, pp_R, pp_A, pp_M, pp_B = simultaneous_fit_LA(
-            T_obs, P_obs, B_obs, R_obs, A_obs, M_obs, draws, tune, cores
+            T_obs, P_obs, R_obs, A_obs, M_obs, B_obs, draws, tune, cores
         )
     elif new:
         model, trace, pp_R, pp_A, pp_M, pp_B = new_likelihood(
-            T_obs, P_obs, B_obs, R_obs, A_obs, M_obs, draws, tune, cores
+            T_obs, P_obs, R_obs, A_obs, M_obs, B_obs, draws, tune, cores
         )
     # plot the traces
     vars = ["f_snow", "f_ice", "f_refreeze"]
@@ -879,9 +832,8 @@ def run_LA(fit_type, draws=4000, tune=2000, cores=1):
 
 if __name__ == "__main__":
 
-    fit_type = "new"
-    draws = 2000
-    tune = 2000
+    draws = 1000
+    tune = 200
     cores = 6
 
     # load observations
@@ -906,7 +858,12 @@ if __name__ == "__main__":
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Hyperparameters (likelihood related priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        sigma = pm.HalfCauchy("R_sigma", 1, shape=4)
+        R_sigma = pm.HalfCauchy("R_sigma", 0.5)
+        A_sigma = pm.HalfCauchy("A_sigma", 2.75)
+        M_sigma = pm.HalfCauchy("M_sigma", 2.5)
+        B_sigma = pm.Cauchy("B_sigma", 0, 0.5)
+
+        sigma = tt.transpose(tt.stack([R_sigma, A_sigma, M_sigma]))
 
     # Define Forward model (wrapped through theano)
     with model:
@@ -921,49 +878,68 @@ if __name__ == "__main__":
         # net balance [m i.e. / yr ]
         B = A + R - M
 
-        mu = tt.as_tensor_variable(
-            [
-                R,
-                A,
-                M,
-                B,
-            ]
-        )
+        mu = tt.transpose(tt.stack([R, A, M]))
 
     # Define likelihood (function?)
     with model:
         # Individual likelihood functions for each component
         est = pm.Normal(
             "est",
-            mu=tt.log(tt.var(mu)),
+            mu=mu,
             sigma=sigma,
             observed=np.array(
                 [
                     R_obs.reshape(-1, 1),
                     A_obs.reshape(-1, 1),
                     M_obs.reshape(-1, 1),
-                    B_obs.reshape(-1, 1),
                 ],
             ),
         )
 
-        # potential = pm.Potential("obs", R_est.sum()*A_est.sum()*M_est.sum())
+    # with model:
+    #     trace = pm.sample(
+    #         init="advi",
+    #         draws=draws,
+    #         tune=tune,
+    #         cores=cores,
+    #         target_accept=0.9,
+    #         return_inferencedata=True,
+    #     )
+
+    # az.plot_trace(trace)
 
     # run inference: Sample
     with model:
-        trace = pm.sample(
-            init="adapt_diag",
-            draws=draws,
-            tune=tune,
-            cores=cores,
-            target_accept=0.9,
-            return_inferencedata=True,
+        approx = pm.fit(
+            draws, callbacks=[pm.callbacks.CheckParametersConvergence(tolerance=1e-4)]
         )
 
-    # do posterior predictive inference
-    with model:
-        ppc = pm.sample_posterior_predictive(trace, var_names=["est"], keep_size=True)
-        pp_R = ppc[0]
-        pp_A = ppc[1]
-        pp_M = ppc[2]
-        pp_B = pp_A + pp_R - pp_M
+    means = approx.bij.rmap(approx.mean.eval())
+    sds = approx.bij.rmap(approx.std.eval())
+    import seaborn as sns
+
+    from scipy import stats
+
+    varnames = means.keys()
+    fig, axs = plt.subplots(nrows=len(varnames), figsize=(12, 18))
+    for var, ax in zip(varnames, axs):
+        mu_arr = means[var]
+        sigma_arr = sds[var]
+        ax.set_title(var)
+        for i, (mu, sigma) in enumerate(zip(mu_arr.flatten(), sigma_arr.flatten())):
+            sd3 = (-4 * sigma + mu, 4 * sigma + mu)
+            x = np.linspace(sd3[0], sd3[1], 300)
+            y = stats.norm(mu, sigma).pdf(x)
+            ax.plot(x, y)
+    fig.tight_layout()
+    fig.savefig("test.pdf")
+    # trace = pm.sample(
+    #     init="adapt_diag",
+    #     draws=draws,
+    #     tune=tune,
+    #     cores=cores,
+    #     target_accept=0.9,
+    #     scaling=np.power(model.dict_to_array(v_params.stds), 2),
+    #     is_cov=True,
+    #     return_inferencedata=True,
+    # )
