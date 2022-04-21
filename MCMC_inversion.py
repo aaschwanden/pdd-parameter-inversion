@@ -832,30 +832,30 @@ def run_LA(fit_type, draws=4000, tune=2000, cores=1):
 
 if __name__ == "__main__":
 
+    RANDOM_SEED = 8927
+    rng = np.random.default_rng(RANDOM_SEED)
+
     draws = 1000
     tune = 200
     cores = 6
 
-    # load observations
+    # # load observations
     T_obs, P_obs, B_obs, R_obs, A_obs, M_obs = read_observation()
 
     n = 100
-    T_obs = np.random.randint(269, 276, n)
-    P_obs = np.random.randint(0, 25, n)
-
-    pdd = PPDModel()
+    size = [12, n]
+    T_obs = np.random.randint(260, 280, size)
+    P_obs = np.random.randint(0, 100, size)
+    pdd = PDDModel()
 
     result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
-
-    print(result)
-
-    import sys
-
-    sys.exit()
-
-    const = dict()
+    R_obs = (result["refreeze"] + rng.normal(scale=0.1, size=n)).ravel()
+    A_obs = (result["accu"] + rng.normal(scale=1, size=n)).ravel()
+    M_obs = (result["melt"] + rng.normal(scale=10, size=n)).ravel()
+    B_obs = (result["smb"] + rng.normal(scale=10, size=n)).ravel()
 
     # initialize the PDD melt model class
+    const = dict()
     PDD_forward = PDD_MCMC(**const)
 
     # Define Priors
@@ -873,9 +873,8 @@ if __name__ == "__main__":
         # ----> Hyperparameters (likelihood related priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         R_sigma = pm.HalfCauchy("R_sigma", 0.5)
-        A_sigma = pm.HalfCauchy("A_sigma", 2.75)
-        M_sigma = pm.HalfCauchy("M_sigma", 2.5)
-        B_sigma = pm.Cauchy("B_sigma", 0, 0.5)
+        A_sigma = pm.HalfCauchy("A_sigma", 2)
+        M_sigma = pm.HalfCauchy("M_sigma", 5)
 
         sigma = tt.transpose(tt.stack([R_sigma, A_sigma, M_sigma]))
 
