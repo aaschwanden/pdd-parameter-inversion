@@ -13,9 +13,6 @@ warnings.filterwarnings(action="ignore")
 theano.config.compute_test_value = "warn"
 # theano.config.mode = "JAX"
 
-# PDD model class
-# ---------------
-
 
 class PDDModel(object):
     """
@@ -610,10 +607,10 @@ def read_observation(file="DMI-HIRHAM5_1980.nc"):
     return (
         temp,
         precip,
-        smb.sum(axis=0),
         refreeze.sum(axis=0),
         snowfall.sum(axis=0),
-        refreeze.sum(axis=0),
+        melt.sum(axis=0),
+        smb.sum(axis=0),
     )
 
 
@@ -840,13 +837,13 @@ if __name__ == "__main__":
     cores = 6
 
     # # load observations
-    T_obs, P_obs, B_obs, R_obs, A_obs, M_obs = read_observation()
+    T_obs, P_obs, R_obs, A_obs, M_obs, B_obs = read_observation()
 
-    n = 100
-    size = [12, n]
-    T_obs = np.random.randint(260, 280, size)
-    P_obs = np.random.randint(0, 100, size)
-    pdd = PDDModel()
+    # n = 100
+    # size = [12, n]
+    # T_obs = np.random.randint(260, 280, size)
+    # P_obs = np.random.randint(0, 100, size)
+    # pdd = PDDModel()
 
     result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
     R_obs = (result["refreeze"] + rng.normal(scale=0.1, size=n)).ravel()
