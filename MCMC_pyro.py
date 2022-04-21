@@ -313,7 +313,7 @@ class BayesianLinear(pyro.nn.module.PyroModule):
         # M_est = pyro.sample("M_est", dist.Normal(M, M_sigma), obs=M_obs)
         B_est = pyro.sample("B_est", dist.Normal(B, B_sigma), obs=B_obs)
 
-        with pyro.plate("data", x_obs.shape[0]):
+        with pyro.plate("data"):
             B_est = pyro.sample("B_est", dist.Normal(B, B_sigma), obs=B_obs)
 
 
@@ -356,13 +356,13 @@ if __name__ == "__main__":
         B_obs,
     ) = read_observation()
 
-    f_snow = pyro.param("f_snow", lambda: torch.randn(()))
-    f_ice = pyro.param("f_ice", lambda: torch.randn(()))
-    f_refreeze = pyro.param("f_refreeze", lambda: torch.randn(()))
+    # f_snow = pyro.param("f_snow", lambda: torch.randn(()))
+    # f_ice = pyro.param("f_ice", lambda: torch.randn(()))
+    # f_refreeze = pyro.param("f_refreeze", lambda: torch.randn(()))
 
-    # f_snow = pyro.sample("f_snow", dist.Normal(4.1, 1.5))
-    # f_ice = pyro.sample("f_ice", dist.Normal(8.0, 2.0))
-    # f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2))
+    f_snow = pyro.sample("f_snow", dist.Normal(4.1, 1.5))
+    f_ice = pyro.sample("f_ice", dist.Normal(8.0, 2.0))
+    f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2))
 
     model = BayesianLinear(
         T_obs, P_obs, np.zeros_like(T_obs), B_obs, f_snow, f_ice, f_refreeze
@@ -374,3 +374,10 @@ if __name__ == "__main__":
 
     for name, value in pyro.get_param_store().items():
         print(name, pyro.param(name).data.cpu().numpy())
+
+    pyro.clear_param_store()
+    num_iters = 5000
+    for i in range(num_iters):
+        elbo = svi.step(T_obs, P_obs, np.zeros_like(T_obs))
+        if i % 500 == 0:
+            logging.info("Elbo loss: {}".format(elbo))
