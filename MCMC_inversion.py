@@ -837,12 +837,17 @@ if __name__ == "__main__":
     cores = 6
 
     # # load observations
-    T_obs, P_obs, R_obs, A_obs, M_obs, B_obs = read_observation()
+    # T_obs, P_obs, R_obs, A_obs, M_obs, B_obs = read_observation()
 
-    # n = 100
-    # size = [12, n]
-    # T_obs = np.random.randint(260, 280, size)
-    # P_obs = np.random.randint(0, 100, size)
+    n = 100
+    m = 12
+
+    T_obs = np.random.randint(260, 282, (m, n)) + +np.random.rand(m, n)
+    P_obs = np.random.randint(10, 100, (m, n)) + np.random.rand(m, n)
+
+    pdd = PDDModel()
+    result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
+    B_obs = result["smb"]
     # pdd = PDDModel()
 
     result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
