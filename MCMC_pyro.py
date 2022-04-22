@@ -549,7 +549,7 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         f_ice = self.f_ice
         f_refeeze = self.f_refreeze
 
-        with pyro.plate("data"):
+        with pyro.plate("data", use_cuda=True):
             pdd_model = TorchPDDModel(
                 pdd_factor_snow=f_snow,
                 pdd_factor_ice=f_ice,
@@ -599,7 +599,7 @@ def model(temp, precip, std_dev, B_obs=None, M_obs=None, R_obs=None):
     f_ice = pyro.sample("f_ice", dist.Normal(8.0 / 1, 2.0 / 1))
     f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2))
 
-    with pyro.plate("data"):
+    with pyro.plate("data", use_cuda=True):
         pdd_model = TorchPDDModel(
             pdd_factor_snow=f_snow,
             pdd_factor_ice=f_ice,
@@ -645,7 +645,7 @@ def guide(temp, precip, std_dev, B_obs=None, M_obs=None, R_obs=None):
         constraint=constraints.positive,
     )
 
-    with pyro.plate("data"):
+    with pyro.plate("data", use_cuda=True):
         f_snow = pyro.sample("f_snow", dist.Normal(f_snow_loc, f_snow_scale))
         f_ice = pyro.sample("f_ice", dist.Normal(f_ice_loc, f_ice_scale))
         f_refreeze = pyro.sample(
