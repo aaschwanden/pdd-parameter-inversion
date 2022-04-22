@@ -1,3 +1,4 @@
+import logging
 import torch
 import numpy as np
 import pylab as plt
@@ -6,6 +7,8 @@ import pyro
 import pyro.distributions as dist
 import pyro.distributions.constraints as constraints
 import pyro.poutine as poutine
+
+torch.autograd.set_detect_anomaly(True)
 
 
 class PDDModel(object):
@@ -306,8 +309,8 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
 
     def __init__(
         self,
-        pdd_factor_snow=0.003,
-        pdd_factor_ice=0.008,
+        pdd_factor_snow=3,
+        pdd_factor_ice=8,
         refreeze_snow=0.0,
         refreeze_ice=0.0,
         temp_snow=0.0,
@@ -381,15 +384,10 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
         snow_refreeze_rate = torch.zeros_like(temp)
         ice_refreeze_rate = torch.zeros_like(temp)
 
-        # compute snow depth and melt rates
-        for i in range(len(temp)):
-            if i > 0:
-                snow_depth[i] = snow_depth[i - 1]
-            snow_depth[i] += accu_rate[i]
-            snow_melt_rate[i], ice_melt_rate[i] = self.melt_rates(
-                snow_depth[i], inst_pdd[i]
-            )
-            snow_depth[i] -= snow_melt_rate[i]
+        snow_depth[:-1] = torch.clone(snow_depth[1:])
+        snow_depth = snow_depth + accu_rate
+        snow_melt_rate, ice_melt_rate = self.melt_rates(snow_depth, inst_pdd)
+        snow_depth = snow_depth - snow_melt_rate
 
         melt_rate = snow_melt_rate + ice_melt_rate
         snow_refreeze_rate = self.refreeze_snow * snow_melt_rate
@@ -521,8 +519,8 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
         """
 
         # parse model parameters for readability
-        ddf_snow = self.pdd_factor_snow
-        ddf_ice = self.pdd_factor_ice
+        ddf_snow = self.pdd_factor_snow / 1e3
+        ddf_ice = self.pdd_factor_ice / 1e3
 
         # compute a potential snow melt
         pot_snow_melt = ddf_snow * pdd
@@ -538,11 +536,8 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
 
 
 class BayesianPDD(pyro.nn.module.PyroModule):
-    def __init__(self, temp, precip, std_dev, B_obs, f_snow, f_ice, f_refreeze):
+    def __init__(self, B_obs, f_snow, f_ice, f_refreeze):
         super().__init__()
-        self.temp = temp
-        self.precip = precip
-        self.std_dev = std_dev
         self.B_obs = B_obs
         self.f_snow = f_snow
         self.f_ice = f_ice
@@ -565,9 +560,9 @@ class BayesianPDD(pyro.nn.module.PyroModule):
             result = pdd_model(temp, precip, std_dev)
 
             B = result["smb"]
-            B_sigma = pyro.sample("B_sigma", dist.Cauchy(0, 0.5))
+            B_sigma = pyro.sample("B_sigma", dist.HalfCauchy(0.5))
             B_obs = self.B_obs
-            return pyro.sample("B_est", dist.Normal(B, B_sigma), obs=B_obs)
+            pyro.sample("B_est", dist.Normal(B, B_sigma), obs=B_obs)
 
 
 def read_observation(file="DMI-HIRHAM5_1980.nc"):
@@ -598,53 +593,94 @@ def read_observation(file="DMI-HIRHAM5_1980.nc"):
     )
 
 
-def model(temp, precip, std_dev, B_obs=None):
+def model(temp, precip, std_dev, B_obs=None, M_obs=None, R_obs=None):
 
-    f_snow = pyro.sample("f_snow", dist.Normal(4.1, 1.5))
-    f_ice = pyro.sample("f_ice", dist.Normal(8.0, 2.0))
+    f_snow = pyro.sample("f_snow", dist.Normal(4.1 / 1, 1.5 / 1))
+    f_ice = pyro.sample("f_ice", dist.Normal(8.0 / 1, 2.0 / 1))
     f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2))
 
-    pdd_model = TorchPDDModel(
-        pdd_factor_snow=f_snow,
-        pdd_factor_ice=f_ice,
-        refreeze_snow=f_refreeze,
-        refreeze_ice=f_refreeze,
+    with pyro.plate("data"):
+        pdd_model = TorchPDDModel(
+            pdd_factor_snow=f_snow,
+            pdd_factor_ice=f_ice,
+            refreeze_snow=f_refreeze,
+            refreeze_ice=f_refreeze,
+        )
+
+        result = pdd_model(temp, precip, std_dev)
+        B = result["smb"]
+        M = result["melt"]
+        R = result["refreeze"]
+
+        B_sigma = pyro.sample("B_sigma", dist.HalfCauchy(1))
+        pyro.sample("B_est", dist.Normal(B, B_sigma), obs=B_obs)
+        M_sigma = pyro.sample("M_sigma", dist.HalfCauchy(1))
+        pyro.sample("M_est", dist.Normal(M, M_sigma), obs=M_obs)
+        R_sigma = pyro.sample("R_sigma", dist.HalfCauchy(1))
+        pyro.sample("R_est", dist.Normal(R, R_sigma), obs=R_obs)
+
+
+def guide(temp, precip, std_dev, B_obs=None, M_obs=None, R_obs=None):
+
+    f_snow_loc = pyro.param("f_snow_loc", lambda: torch.tensor(4.1 / 1))
+    f_snow_scale = pyro.param(
+        "f_snow_scale",
+        lambda: torch.tensor(1.5 / 1),
+        constraint=constraints.positive,
     )
 
-    result = pdd_model(temp, precip, std_dev)
+    f_ice_loc = pyro.param("f_ice_loc", lambda: torch.tensor(8.0 / 1))
+    f_ice_scale = pyro.param(
+        "f_ice_scale", lambda: torch.tensor(2.0 / 1), constraint=constraints.positive
+    )
 
-    B = result["smb"]
-
-    B_sigma = pyro.sample("B_sigma", dist.Cauchy(0, 0.5))
-
-    # R_est = pyro.sample("R_est", dist.Normal(R, R_sigma), obs=R_obs)
-    # A_est = pyro.sample("A_est", dist.Normal(A, A_sigma), obs=A_obs)
-    # M_est = pyro.sample("M_est", dist.Normal(M, M_sigma), obs=M_obs)
-    # B_est = pyro.sample("B_est", dist.Normal(B, B_sigma), obs=B_obs)
+    f_refreeze_loc = pyro.param(
+        "f_refreeze_loc",
+        lambda: torch.tensor(0.5),
+        constraint=constraints.interval(0.0, 1.0),
+    )
+    f_refreeze_scale = pyro.param(
+        "f_refreeze_scale",
+        lambda: torch.tensor(0.2),
+        constraint=constraints.positive,
+    )
 
     with pyro.plate("data"):
-        return pyro.sample("B_est", dist.Normal(B, B_sigma), obs=B_obs)
+        f_snow = pyro.sample("f_snow", dist.Normal(f_snow_loc, f_snow_scale))
+        f_ice = pyro.sample("f_ice", dist.Normal(f_ice_loc, f_ice_scale))
+        f_refreeze = pyro.sample(
+            "f_refreeze", dist.Normal(f_refreeze_loc, f_refreeze_scale)
+        )
 
+        pdd_model = TorchPDDModel(
+            pdd_factor_snow=f_snow,
+            pdd_factor_ice=f_ice,
+            refreeze_snow=f_refreeze,
+            refreeze_ice=f_refreeze,
+        )
+        result = pdd_model(temp, precip, std_dev)
+        B = result["smb"]
+        M = result["melt"]
+        R = result["refreeze"]
 
-def guide(temp, precip, std_dev, B_obs=None):
+        B_sigma = pyro.sample("B_sigma", dist.HalfCauchy(1))
+        pyro.sample(
+            "B_est",
+            dist.Normal(B, B_sigma),
+        )
 
-    a_loc = pyro.param("a_loc", lambda: torch.tensor(0.0))
-    a_scale = pyro.param(
-        "a_scale", lambda: torch.tensor(1.0), constraint=constraints.positive
-    )
-    sigma_loc = pyro.param(
-        "sigma_loc", lambda: torch.tensor(1.0), constraint=constraints.positive
-    )
-    weights_loc = pyro.param("weights_loc", lambda: torch.randn(3))
-    weights_scale = pyro.param(
-        "weights_scale", lambda: torch.ones(3), constraint=constraints.positive
-    )
-    a = pyro.sample("a", dist.Normal(a_loc, a_scale))
-    b_a = pyro.sample("bA", dist.Normal(weights_loc[0], weights_scale[0]))
-    b_r = pyro.sample("bR", dist.Normal(weights_loc[1], weights_scale[1]))
-    b_ar = pyro.sample("bAR", dist.Normal(weights_loc[2], weights_scale[2]))
-    sigma = pyro.sample("sigma", dist.Normal(sigma_loc, torch.tensor(0.05)))
-    return {"a": a, "b_a": b_a, "b_r": b_r, "b_ar": b_ar, "sigma": sigma}
+        M_sigma = pyro.sample("M_sigma", dist.HalfCauchy(1))
+        pyro.sample(
+            "M_est",
+            dist.Normal(M, M_sigma),
+        )
+
+        R_sigma = pyro.sample("R_sigma", dist.HalfCauchy(1))
+        pyro.sample(
+            "R_est",
+            dist.Normal(R, R_sigma),
+        )
+        return {"f_snow": f_snow, "f_ice": f_ice, "f_refreeze": f_refreeze}
 
 
 if __name__ == "__main__":
@@ -657,54 +693,114 @@ if __name__ == "__main__":
     #     M_obs,
     #     B_obs,
     # ) = read_observation()
+    # pyro.clear_param_store()
 
     n = 100
     m = 12
-
-    T_obs = np.random.randint(260, 282, (m, n)) + +np.random.rand(m, n)
-    P_obs = np.random.randint(10, 100, (m, n)) + np.random.rand(m, n)
-
+    rng = np.random.default_rng(2021)
+    T_obs = rng.integers(260, 280, (m, n)) + rng.random((m, n))
+    P_obs = rng.integers(10, 1000, (m, n)) + rng.random((m, n))
     pdd = PDDModel()
-    result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
+    result = pdd(T_obs, P_obs, np.zeros_like(T_obs) + 4.3)
     B_obs = result["smb"]
+    M_obs = result["melt"]
+    R_obs = result["refreeze"]
 
-    f_snow_loc = pyro.param("f_snow_loc", lambda: torch.tensor(4.1))
-    f_snow_scale = pyro.param(
-        "f_snow_scale", lambda: torch.tensor(1.5), constraint=constraints.positive
+    # f_snow_loc = pyro.param("f_snow_loc", lambda: torch.tensor(4.1))
+    # f_snow_scale = pyro.param(
+    #     "f_snow_scale", lambda: torch.tensor(1.5), constraint=constraints.positive
+    # )
+    # f_snow = pyro.sample("f_snow", dist.Normal(f_snow_loc, f_snow_scale))
+
+    # f_ice_loc = pyro.param("f_ice_loc", lambda: torch.tensor(8.0))
+    # f_ice_scale = pyro.param(
+    #     "f_ice_scale", lambda: torch.tensor(2.0), constraint=constraints.positive
+    # )
+    # f_ice = pyro.sample("f_ice", dist.Normal(f_ice_loc, f_ice_scale))
+
+    # f_refreeze_loc = pyro.param("f_refreeze_loc", lambda: torch.tensor(0.5))
+    # f_refreeze_scale = pyro.param(
+    #     "f_refreeze_scale", lambda: torch.tensor(0.2), constraint=constraints.positive
+    # )
+    # f_refreeze = pyro.sample(
+    #     "f_refreeze", dist.Normal(f_refreeze_loc, f_refreeze_scale)
+    # )
+
+    f_snow = pyro.sample("f_snow", dist.Normal(4.1 / 1000, 1.5 / 1000))
+    f_ice = pyro.sample("f_snow", dist.Normal(8.0 / 1000, 2.0 / 1000))
+    f_refreeze = pyro.sample("f_snow", dist.Normal(0.5, 0.2))
+
+    # model = BayesianPDD(B_obs, f_snow, f_ice, f_refreeze)
+    # print("params before:", [name for name, _ in model.named_parameters()])
+
+    print("Making graph")
+    graph = pyro.render_model(
+        model,
+        model_args=(T_obs, P_obs, np.zeros_like(T_obs)),
+        filename="model.pdf",
     )
-    f_snow = pyro.sample("f_snow", dist.Normal(f_snow_loc, f_snow_scale))
-
-    f_ice_loc = pyro.param("f_ice_loc", lambda: torch.tensor(8.0))
-    f_ice_scale = pyro.param(
-        "f_ice_scale", lambda: torch.tensor(2.0), constraint=constraints.positive
-    )
-    f_ice = pyro.sample("f_ice", dist.Normal(f_ice_loc, f_ice_scale))
-
-    f_refeeze_loc = pyro.param("f_refreeze_loc", lambda: torch.tensor(0.5))
-    f_refeeze_scale = pyro.param(
-        "f_refreeze_scale", lambda: torch.tensor(0.2), constraint=constraints.positive
-    )
-    f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2))
-
-    model = BayesianPDD(
-        T_obs, P_obs, np.zeros_like(T_obs), B_obs, f_snow, f_ice, f_refreeze
-    )
-    print("params before:", [name for name, _ in model.named_parameters()])
-
-    with poutine.trace() as tr:
-        model(T_obs, P_obs, np.zeros_like(T_obs))
-
-    auto_guide = pyro.infer.autoguide.AutoNormal(model)
+    # auto_guide = pyro.infer.autoguide.AutoNormal(model)
     adam = pyro.optim.Adam({"lr": 0.02})  # Consider decreasing learning rate.
     elbo = pyro.infer.Trace_ELBO()
-    svi = pyro.infer.SVI(model, auto_guide, adam, elbo)
+    print("Setting up SVI")
+    svi = pyro.infer.SVI(model, guide, adam, elbo)
+
+    # pyro.clear_param_store()
+    num_iters = 5000
+    losses = []
+    for i in range(num_iters):
+        elbo = svi.step(
+            T_obs,
+            P_obs,
+            np.zeros_like(T_obs),
+            torch.from_numpy(B_obs),
+            torch.from_numpy(M_obs),
+            torch.from_numpy(R_obs),
+        )
+        losses.append(elbo)
+        if i % 100 == 0:
+            print(f"Iteration {i} loss: {elbo}")
+            logging.info("Elbo loss: {}".format(elbo))
+            print(pyro.param("f_snow_loc").item())
+            print(pyro.param("f_ice_loc").item())
+            print(pyro.param("f_refreeze_loc").item())
+
+    print(pyro.param("f_snow_loc").item())
+    print(pyro.param("f_ice_loc").item())
+    print(pyro.param("f_refreeze_loc").item())
+
+    fig = plt.figure(figsize=(5, 2))
+    ax = fig.add_subplot(111)
+    ax.plot(losses)
+    ax.set_xlabel("SVI step")
+    ax.set_ylabel("ELBO loss")
+    ax.set_ylim(0, 1e18)
 
     for name, value in pyro.get_param_store().items():
         print(name, pyro.param(name).data.cpu().numpy())
 
-    pyro.clear_param_store()
-    num_iters = 5000
-    for i in range(num_iters):
-        elbo = svi.step(T_obs, P_obs, np.zeros_like(T_obs))
-        if i % 500 == 0:
-            logging.info("Elbo loss: {}".format(elbo))
+    with pyro.plate("samples", n, dim=-1):
+        samples = guide(
+            T_obs,
+            P_obs,
+            np.zeros_like(T_obs),
+        )
+
+    fs = samples["f_snow"]
+    fi = samples["f_ice"]
+
+    print(samples)
+    import seaborn as sns
+
+    fig = plt.figure(figsize=(10, 6))
+
+    sns.histplot(fs.detach().cpu().numpy(), kde=True, stat="density", label="f_snow")
+    sns.histplot(
+        fi.detach().cpu().numpy(),
+        kde=True,
+        stat="density",
+        label="f_ice",
+        color="orange",
+    )
+    plt.legend()
+    plt.show()

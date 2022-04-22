@@ -841,14 +841,12 @@ if __name__ == "__main__":
 
     n = 100
     m = 12
-
-    T_obs = np.random.randint(260, 282, (m, n)) + +np.random.rand(m, n)
-    P_obs = np.random.randint(10, 100, (m, n)) + np.random.rand(m, n)
-
+    rng = np.random.default_rng(2021)
+    T_obs = rng.integers(260, 280, (m, n)) + rng.random((m, n))
+    P_obs = rng.integers(10, 1000, (m, n)) + rng.random((m, n))
     pdd = PDDModel()
-    result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
+    result = pdd(T_obs, P_obs, np.zeros_like(T_obs) + 4.3)
     B_obs = result["smb"]
-    # pdd = PDDModel()
 
     result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
     R_obs = (result["refreeze"] + rng.normal(scale=0.1, size=n)).ravel()
@@ -865,8 +863,12 @@ if __name__ == "__main__":
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Mass balance Model (physical priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        f_snow_prior = pm.TruncatedNormal("f_snow", mu=4.1, sigma=1.5, lower=0.0)
-        f_ice_prior = pm.TruncatedNormal("f_ice", mu=8.0, sigma=2.0, lower=0.0)
+        f_snow_prior = pm.TruncatedNormal(
+            "f_snow", mu=4.1 / 1000, sigma=1.5 / 1000, lower=0.0
+        )
+        f_ice_prior = pm.TruncatedNormal(
+            "f_ice", mu=8.0 / 1000, sigma=2.0 / 1000, lower=0.0
+        )
         f_refreeze_prior = pm.TruncatedNormal(
             "f_refreeze", mu=0.5, sigma=0.2, lower=0.0, upper=1
         )
