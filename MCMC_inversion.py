@@ -526,8 +526,8 @@ class TTPDDModel(object):
         """
 
         # parse model parameters for readability
-        ddf_snow = self.pdd_factor_snow
-        ddf_ice = self.pdd_factor_ice
+        ddf_snow = self.pdd_factor_snow / 1000
+        ddf_ice = self.pdd_factor_ice / 1000
 
         # compute a potential snow melt
         pot_snow_melt = ddf_snow * pdd
@@ -863,12 +863,8 @@ if __name__ == "__main__":
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Mass balance Model (physical priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        f_snow_prior = pm.TruncatedNormal(
-            "f_snow", mu=4.1 / 1000, sigma=1.5 / 1000, lower=0.0
-        )
-        f_ice_prior = pm.TruncatedNormal(
-            "f_ice", mu=8.0 / 1000, sigma=2.0 / 1000, lower=0.0
-        )
+        f_snow_prior = pm.TruncatedNormal("f_snow", mu=4.1, sigma=1.5, lower=0.0)
+        f_ice_prior = pm.TruncatedNormal("f_ice", mu=8.0, sigma=2.0, lower=0.0)
         f_refreeze_prior = pm.TruncatedNormal(
             "f_refreeze", mu=0.5, sigma=0.2, lower=0.0, upper=1
         )

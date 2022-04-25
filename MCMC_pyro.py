@@ -45,8 +45,8 @@ class PDDModel(object):
 
     def __init__(
         self,
-        pdd_factor_snow=0.003,
-        pdd_factor_ice=0.008,
+        pdd_factor_snow=3,
+        pdd_factor_ice=8,
         refreeze_snow=0.0,
         refreeze_ice=0.0,
         temp_snow=0.0,
@@ -259,8 +259,8 @@ class PDDModel(object):
         """
 
         # parse model parameters for readability
-        ddf_snow = self.pdd_factor_snow
-        ddf_ice = self.pdd_factor_ice
+        ddf_snow = self.pdd_factor_snow / 1000
+        ddf_ice = self.pdd_factor_ice / 1000
 
         # compute a potential snow melt
         pot_snow_melt = ddf_snow * pdd
@@ -595,9 +595,9 @@ def read_observation(file="DMI-HIRHAM5_1980.nc"):
 
 def model(temp, precip, std_dev, B_obs=None, M_obs=None, R_obs=None):
 
-    f_snow = pyro.sample("f_snow", dist.Normal(4.1 / 1, 1.5 / 1))
-    f_ice = pyro.sample("f_ice", dist.Normal(8.0 / 1, 2.0 / 1))
-    f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2))
+    f_snow = pyro.sample("f_snow", dist.Normal(4.1 / 1, 2.5 / 1))
+    f_ice = pyro.sample("f_ice", dist.Normal(8.0 / 1, 2.5 / 1))
+    f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.25))
 
     with pyro.plate("data", use_cuda=True):
         pdd_model = TorchPDDModel(
@@ -625,13 +625,13 @@ def guide(temp, precip, std_dev, B_obs=None, M_obs=None, R_obs=None):
     f_snow_loc = pyro.param("f_snow_loc", lambda: torch.tensor(4.1 / 1))
     f_snow_scale = pyro.param(
         "f_snow_scale",
-        lambda: torch.tensor(1.5 / 1),
+        lambda: torch.tensor(2.5 / 1),
         constraint=constraints.positive,
     )
 
     f_ice_loc = pyro.param("f_ice_loc", lambda: torch.tensor(8.0 / 1))
     f_ice_scale = pyro.param(
-        "f_ice_scale", lambda: torch.tensor(2.0 / 1), constraint=constraints.positive
+        "f_ice_scale", lambda: torch.tensor(2.5 / 1), constraint=constraints.positive
     )
 
     f_refreeze_loc = pyro.param(
@@ -641,7 +641,7 @@ def guide(temp, precip, std_dev, B_obs=None, M_obs=None, R_obs=None):
     )
     f_refreeze_scale = pyro.param(
         "f_refreeze_scale",
-        lambda: torch.tensor(0.2),
+        lambda: torch.tensor(0.25),
         constraint=constraints.positive,
     )
 
@@ -700,9 +700,10 @@ if __name__ == "__main__":
     rng = np.random.default_rng(2021)
     T_obs = rng.integers(260, 280, (m, n)) + rng.random((m, n))
     P_obs = rng.integers(10, 1000, (m, n)) + rng.random((m, n))
-    pdd = PDDModel()
-    result = pdd(T_obs, P_obs, np.zeros_like(T_obs) + 4.3)
+    pdd = PDDModel(pdd_factor_snow=3, pdd_factor_ice=8, refreeze_snow=0.5)
+    result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
     B_obs = result["smb"]
+    A_obs = result["accu"]
     M_obs = result["melt"]
     R_obs = result["refreeze"]
 
@@ -726,11 +727,11 @@ if __name__ == "__main__":
     #     "f_refreeze", dist.Normal(f_refreeze_loc, f_refreeze_scale)
     # )
 
-    f_snow = pyro.sample("f_snow", dist.Normal(4.1 / 1000, 1.5 / 1000))
-    f_ice = pyro.sample("f_snow", dist.Normal(8.0 / 1000, 2.0 / 1000))
-    f_refreeze = pyro.sample("f_snow", dist.Normal(0.5, 0.2))
+    f_snow = pyro.sample("f_snow", dist.Normal(4.1, 1.5))
+    f_ice = pyro.sample("f_ice", dist.Normal(8.0, 2.0))
+    f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2))
 
-    # model = BayesianPDD(B_obs, f_snow, f_ice, f_refreeze)
+    bmodel = BayesianPDD(B_obs, f_snow, f_ice, f_refreeze)
     # print("params before:", [name for name, _ in model.named_parameters()])
 
     print("Making graph")
@@ -739,7 +740,7 @@ if __name__ == "__main__":
         model_args=(T_obs, P_obs, np.zeros_like(T_obs)),
         filename="model.pdf",
     )
-    # auto_guide = pyro.infer.autoguide.AutoNormal(model)
+    auto_guide = pyro.infer.autoguide.AutoNormal(bmodel)
     adam = pyro.optim.Adam({"lr": 0.02})  # Consider decreasing learning rate.
     elbo = pyro.infer.Trace_ELBO()
     print("Setting up SVI")
@@ -789,7 +790,6 @@ if __name__ == "__main__":
     fs = samples["f_snow"]
     fi = samples["f_ice"]
 
-    print(samples)
     import seaborn as sns
 
     fig = plt.figure(figsize=(10, 6))
