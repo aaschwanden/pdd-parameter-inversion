@@ -769,19 +769,14 @@ if __name__ == "__main__":
     rng = np.random.default_rng(2021)
     T_obs = rng.integers(260, 280, (m, n)) + rng.random((m, n))
     P_obs = rng.integers(10, 1000, (m, n)) + rng.random((m, n))
-    pdd = PDDModel(
-        pdd_factor_snow=4.1, pdd_factor_ice=8, refreeze_snow=0.0, refreeze_ice=0.0
+    pdd = TorchPDDModel(
+        pdd_factor_snow=4.1, pdd_factor_ice=8, refreeze_snow=0.60, refreeze_ice=0.0
     )
     result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
     B_obs = result["smb"]
     A_obs = result["accu"]
     M_obs = result["melt"]
     R_obs = result["refreeze"]
-
-    tpdd = TorchPDDModel(
-        pdd_factor_snow=4.1, pdd_factor_ice=8, refreeze_snow=0.0, refreeze_ice=0.0
-    )
-    torch_result = tpdd(T_obs, P_obs, np.zeros_like(T_obs))
 
     # Make sure the two PDD models agree
     # for key in torch_result.keys():
@@ -811,25 +806,25 @@ if __name__ == "__main__":
         filename="bmodel.pdf",
     )
     auto_guide = pyro.infer.autoguide.AutoNormal(bmodel)
-    adam = pyro.optim.Adam({"lr": 0.01})  # Consider decreasing learning rate.
+    adam = pyro.optim.Adam({"lr": 0.1})  # Consider decreasing learning rate.
     elbo = pyro.infer.Trace_ELBO()
     print("Setting up SVI")
     svi = pyro.infer.SVI(model, guide, adam, elbo)
 
     # pyro.clear_param_store()
-    num_iters = 10000
+    num_iters = 5000
     losses = []
     for i in range(num_iters):
         elbo = svi.step(
             T_obs,
             P_obs,
             np.zeros_like(T_obs),
-            torch.from_numpy(A_obs),
-            torch.from_numpy(M_obs),
-            torch.from_numpy(R_obs),
+            A_obs,
+            M_obs,
+            R_obs,
         )
         losses.append(elbo)
-        if i % 100 == 0:
+        if i % 1000 == 0:
             print(f"Iteration {i} loss: {elbo}")
             logging.info("Elbo loss: {}".format(elbo))
             print(pyro.param("f_snow_loc").item())
