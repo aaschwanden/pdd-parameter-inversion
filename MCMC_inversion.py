@@ -844,8 +844,8 @@ if __name__ == "__main__":
     rng = np.random.default_rng(2021)
     T_obs = rng.integers(260, 280, (m, n)) + rng.random((m, n))
     P_obs = rng.integers(10, 1000, (m, n)) + rng.random((m, n))
-    pdd = PDDModel()
-    result = pdd(T_obs, P_obs, np.zeros_like(T_obs) + 4.3)
+    pdd = PDDModel(pdd_factor_snow=4.1)
+    result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
     B_obs = result["smb"]
 
     result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
