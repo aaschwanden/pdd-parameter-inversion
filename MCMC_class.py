@@ -568,14 +568,14 @@ class BayesianPDD(pyro.nn.module.PyroModule):
 
         with pyro.plate("obs", use_cuda=self.use_cuda):
 
-            B_sigma = pyro.sample("B_sigma", dist.HalfCauchy(5))
-            pyro.sample("B_est", dist.Normal(B, B_sigma).to_event(1), obs=B_obs)
             A_sigma = pyro.sample("A_sigma", dist.HalfCauchy(2))
             pyro.sample("A_est", dist.Normal(A, A_sigma).to_event(1), obs=A_obs)
             M_sigma = pyro.sample("M_sigma", dist.HalfCauchy(5))
             pyro.sample("M_est", dist.Normal(M, M_sigma).to_event(1), obs=M_obs)
             R_sigma = pyro.sample("R_sigma", dist.HalfCauchy(0.5))
             pyro.sample("R_est", dist.Normal(R, R_sigma).to_event(1), obs=R_obs)
+            B_sigma = pyro.sample("B_sigma", dist.HalfCauchy(5))
+            pyro.sample("B_est", dist.Normal(B, B_sigma).to_event(1), obs=B_obs)
 
             return {
                 "f_snow": f_snow,
@@ -621,17 +621,22 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         )
 
         result = pdd_model.forward(temp, precip, std_dev)
+        return {
+            "f_snow": f_snow,
+            "f_ice": f_ice,
+            "refreeze": refreeze,
+        }
 
     def forward(
         self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None, B_obs=None
     ):
 
-        adam = pyro.optim.Adam({"lr": 0.1})  # Consider decreasing learning rate.
+        pyro.clear_param_store()
+        adam = pyro.optim.Adam({"lr": 0.01})  # Consider decreasing learning rate.
         elbo = pyro.infer.Trace_ELBO()
         print("Setting up SVI")
         svi = pyro.infer.SVI(model.model, model.guide, adam, elbo)
-        # pyro.clear_param_store()
-        num_iters = 5000
+        num_iters = 10000
         losses = []
         for i in range(num_iters):
             elbo = svi.step(T_obs, P_obs, np.zeros_like(T_obs), A_obs, M_obs, R_obs)
