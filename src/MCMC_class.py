@@ -570,11 +570,11 @@ class BayesianPDD(pyro.nn.module.PyroModule):
 
             A_sigma = pyro.sample("A_sigma", dist.HalfCauchy(2))
             pyro.sample("A_est", dist.Normal(A, A_sigma).to_event(1), obs=A_obs)
-            M_sigma = pyro.sample("M_sigma", dist.HalfCauchy(10))
+            M_sigma = pyro.sample("M_sigma", dist.HalfCauchy(5))
             pyro.sample("M_est", dist.Normal(M, M_sigma).to_event(1), obs=M_obs)
             R_sigma = pyro.sample("R_sigma", dist.HalfCauchy(0.5))
             pyro.sample("R_est", dist.Normal(R, R_sigma).to_event(1), obs=R_obs)
-            B_sigma = pyro.sample("B_sigma", dist.HalfCauchy(10))
+            B_sigma = pyro.sample("B_sigma", dist.HalfCauchy(5))
             pyro.sample("B_est", dist.Normal(B, B_sigma).to_event(1), obs=B_obs)
 
             return {
@@ -632,7 +632,7 @@ class BayesianPDD(pyro.nn.module.PyroModule):
     ):
 
         pyro.clear_param_store()
-        adam = pyro.optim.Adam({"lr": 0.01})  # Consider decreasing learning rate.
+        adam = pyro.optim.Adam({"lr": 0.1})  # Consider decreasing learning rate.
         elbo = pyro.infer.Trace_ELBO()
         print("Setting up SVI")
         svi = pyro.infer.SVI(model.model, model.guide, adam, elbo)
@@ -688,21 +688,10 @@ if __name__ == "__main__":
     R_obs = result["refreeze"]
 
     model = BayesianPDD()
-    # print("params before:", [name for name, _ in model.named_parameters()])
-
-    # print("Making graph")
-    # graph = pyro.render_model(
-    #     model,
-    #     model_args=(T_obs, P_obs, np.zeros_like(T_obs)),
-    #     filename="bayesian_model.pdf",
-    # )
     model.forward(T_obs, P_obs, std_dev, A_obs, M_obs, R_obs)
-    print(f"""{pyro.param("f_snow_loc").item():.2f}""")
-    print(f"""{pyro.param("f_ice_loc").item():.2f}""")
-    print(f"""{pyro.param("refreeze_loc").item():.2f}""")
-
+    print("Recovered parameters")
     for name, value in pyro.get_param_store().items():
-        print(name, pyro.param(name).data.cpu().numpy())
+        print(name, f"""{pyro.param(name).data.cpu().numpy():.2f}""")
 
     with pyro.plate("samples", T_obs.shape[1], dim=-1):
         samples = model.guide(
@@ -716,6 +705,7 @@ if __name__ == "__main__":
     r = samples["refreeze"]
 
     import seaborn as sns
+    from scipy.stats import norm
 
     fig = plt.figure(figsize=(10, 6))
 
@@ -727,5 +717,8 @@ if __name__ == "__main__":
         label="f_ice",
         color="orange",
     )
+    x = np.arange(0, 16, 0.001)
+    plt.plot(x, norm.pdf(x, 4.2, 1), lw=2, label="f_snow_prior")
+    plt.plot(x, norm.pdf(x, 8.0, 1), color="orange", lw=2, label="f_ice_prior")
     plt.legend()
     plt.show()
