@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings(action="ignore")
 theano.config.compute_test_value = "warn"
-# theano.config.mode = "JAX"
 
 
 class PDDModel(object):
@@ -48,8 +47,8 @@ class PDDModel(object):
 
     def __init__(
         self,
-        pdd_factor_snow=0.003,
-        pdd_factor_ice=0.008,
+        pdd_factor_snow=3,
+        pdd_factor_ice=8,
         refreeze_snow=0.0,
         refreeze_ice=0.0,
         temp_snow=0.0,
@@ -108,9 +107,11 @@ class PDDModel(object):
         stdv = self._expand(stdv, maxshape)
 
         # interpolate time-series
-        temp = self._interpolate(temp)
-        prec = self._interpolate(prec)
-        stdv = self._interpolate(stdv)
+        # interpolate time-series
+        if self.interpolate_n >= 1:
+            temp = self._interpolate(temp)
+            prec = self._interpolate(prec)
+            stdv = self._interpolate(stdv)
 
         # compute accumulation and pdd
         accu_rate = self.accu_rate(temp, prec)
@@ -262,8 +263,8 @@ class PDDModel(object):
         """
 
         # parse model parameters for readability
-        ddf_snow = self.pdd_factor_snow
-        ddf_ice = self.pdd_factor_ice
+        ddf_snow = self.pdd_factor_snow / 1000
+        ddf_ice = self.pdd_factor_ice / 1000
 
         # compute a potential snow melt
         pot_snow_melt = ddf_snow * pdd
@@ -312,8 +313,8 @@ class TTPDDModel(object):
 
     def __init__(
         self,
-        pdd_factor_snow=0.003,
-        pdd_factor_ice=0.008,
+        pdd_factor_snow=3,
+        pdd_factor_ice=8,
         refreeze_snow=0.0,
         refreeze_ice=0.0,
         temp_snow=0.0,
@@ -614,13 +615,6 @@ def read_observation(file="DMI-HIRHAM5_1980.nc"):
     )
 
 
-def plot_posterior(trace, vars: list, out_fp: str):
-    """Wrapper for arviz trace plot"""
-    _ = az.plot_trace(trace, var_names=vars)
-    plt.tight_layout()
-    plt.savefig(out_fp, dpi=300)
-
-
 if __name__ == "__main__":
 
     RANDOM_SEED = 8927
@@ -633,20 +627,38 @@ if __name__ == "__main__":
     # # load observations
     # T_obs, P_obs, R_obs, A_obs, M_obs, B_obs = read_observation()
 
-    n = 100
+    n = 10
     m = 12
-    rng = np.random.default_rng(2021)
-    T_obs = rng.integers(260, 280, (m, n)) + rng.random((m, n))
-    P_obs = rng.integers(10, 1000, (m, n)) + rng.random((m, n))
-    pdd = PDDModel(pdd_factor_snow=4.1)
-    result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
-    B_obs = result["smb"]
 
-    result = pdd(T_obs, P_obs, np.zeros_like(T_obs))
-    R_obs = (result["refreeze"] + rng.normal(scale=0.1, size=n)).ravel()
-    A_obs = (result["accu"] + rng.normal(scale=1, size=n)).ravel()
-    M_obs = (result["melt"] + rng.normal(scale=10, size=n)).ravel()
-    B_obs = (result["smb"] + rng.normal(scale=10, size=n)).ravel()
+    lx = ly = 750000
+    x = np.linspace(-lx, lx, n)
+    y = np.linspace(-ly, ly, n)
+    t = (np.arange(12) + 0.5) / 12
+
+    # assign temperature and precipitation values
+    (yy, xx) = np.meshgrid(y, x)
+    temp = np.zeros((m, n, n))
+    prec = np.zeros((m, n, n))
+    stdv = np.zeros((m, n, n))
+    for i in range(len(t)):
+        temp[i] = -10 * yy / ly - 5 * np.cos(i * 2 * np.pi / 12)
+        prec[i] = xx / lx * (np.sign(xx) - np.cos(i * 2 * np.pi / 12))
+        stdv[i] = (2 + xx / lx - yy / ly) * (1 - np.cos(i * 2 * np.pi / 12))
+
+    T_obs = temp.reshape(m, -1)
+    P_obs = prec.reshape(m, -1)
+    std_dev = stdv.reshape(m, -1)
+    pdd = PDDModel(
+        pdd_factor_snow=3,
+        pdd_factor_ice=8,
+        refreeze_snow=0.0,
+        refreeze_ice=0.0,
+    )
+    result = pdd(T_obs, P_obs, std_dev)
+    B_obs = result["smb"]
+    A_obs = result["accu"]
+    M_obs = result["melt"]
+    R_obs = result["refreeze"]
 
     # initialize the PDD melt model class
     const = dict()
@@ -677,7 +689,7 @@ if __name__ == "__main__":
         R, A, M = PDD_forward.forward(
             T_obs,
             P_obs,
-            np.zeros_like(T_obs),
+            std_dev,
             f_snow_prior,
             f_ice_prior,
             f_refreeze_prior,
@@ -703,17 +715,17 @@ if __name__ == "__main__":
             ),
         )
 
-    # with model:
-    #     trace = pm.sample(
-    #         init="advi",
-    #         draws=draws,
-    #         tune=tune,
-    #         cores=cores,
-    #         target_accept=0.9,
-    #         return_inferencedata=True,
-    #     )
+    with model:
+        trace = pm.sample(
+            init="advi",
+            draws=draws,
+            tune=tune,
+            cores=cores,
+            target_accept=0.9,
+            return_inferencedata=True,
+        )
 
-    # az.plot_trace(trace)
+    az.plot_trace(trace)
 
     # run inference: Sample
     with model:
@@ -740,13 +752,3 @@ if __name__ == "__main__":
             ax.plot(x, y)
     fig.tight_layout()
     fig.savefig("test.pdf")
-    # trace = pm.sample(
-    #     init="adapt_diag",
-    #     draws=draws,
-    #     tune=tune,
-    #     cores=cores,
-    #     target_accept=0.9,
-    #     scaling=np.power(model.dict_to_array(v_params.stds), 2),
-    #     is_cov=True,
-    #     return_inferencedata=True,
-    # )
