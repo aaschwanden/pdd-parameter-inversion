@@ -546,7 +546,7 @@ class TTPDDModel(object):
 class PDD_MCMC:
     def __init__(self):
         # These a arguments which all models will need. Any of the model
-        # pamaeters which are dependent on the model formulation are passed
+        # parameters which are dependent on the model formulation are passed
         # as kwargs.
 
         pass
@@ -584,10 +584,10 @@ class PDD_MCMC:
         M = result["melt"]
         R = result["refreeze"]
 
-        return R, A, M
+        return A, M, R
 
 
-def read_observation(file="DMI-HIRHAM5_1980.nc"):
+def read_observation(file="../DMI-HIRHAM5_1980_MM.nc", thinning_factor=1):
     """
     Read and return Obs
     """
@@ -606,12 +606,12 @@ def read_observation(file="DMI-HIRHAM5_1980.nc"):
         precip = rainfall + snowfall
 
     return (
-        temp,
-        precip,
-        refreeze.sum(axis=0),
-        snowfall.sum(axis=0),
-        melt.sum(axis=0),
-        smb.sum(axis=0),
+        temp[..., ::thinning_factor],
+        precip[..., ::thinning_factor],
+        refreeze.sum(axis=0)[..., ::thinning_factor],
+        snowfall.sum(axis=0)[..., ::thinning_factor],
+        melt.sum(axis=0)[..., ::thinning_factor],
+        smb.sum(axis=0)[..., ::thinning_factor],
     )
 
 
@@ -620,14 +620,14 @@ if __name__ == "__main__":
     RANDOM_SEED = 8927
     rng = np.random.default_rng(RANDOM_SEED)
 
-    draws = 1000
-    tune = 200
+    draws = 4000
+    tune = 1000
     cores = 6
 
-    # # load observations
-    # T_obs, P_obs, R_obs, A_obs, M_obs, B_obs = read_observation()
+    # load observations
+    # T_obs, P_obs, R_obs, A_obs, M_obs, B_obs = read_observation(thinning_factor=20)
 
-    n = 10
+    n = 20
     m = 12
 
     lx = ly = 750000
@@ -649,13 +649,17 @@ if __name__ == "__main__":
     P_obs = prec.reshape(m, -1)
     std_dev = stdv.reshape(m, -1)
     pdd = PDDModel(
-        pdd_factor_snow=3,
-        pdd_factor_ice=8,
+        pdd_factor_snow=2,
+        pdd_factor_ice=10,
         refreeze_snow=0.0,
         refreeze_ice=0.0,
     )
-    result = pdd(T_obs, P_obs, std_dev)
-    B_obs = result["smb"]
+    # result = pdd(T_obs, P_obs, std_dev)
+    T_obs_norm = (T_obs - T_obs.mean()) / T_obs.std()
+    P_obs_norm = (P_obs - P_obs.mean()) / P_obs.std()
+    std_dev = np.zeros_like(T_obs)
+    result = pdd(T_obs_norm, P_obs_norm, std_dev)
+    # B_obs = result["smb"]
     A_obs = result["accu"]
     M_obs = result["melt"]
     R_obs = result["refreeze"]
@@ -669,7 +673,7 @@ if __name__ == "__main__":
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Mass balance Model (physical priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        f_snow_prior = pm.TruncatedNormal("f_snow", mu=4.1, sigma=1.5, lower=0.0)
+        f_snow_prior = pm.TruncatedNormal("f_snow", mu=4.0, sigma=1.5, lower=0.0)
         f_ice_prior = pm.TruncatedNormal("f_ice", mu=8.0, sigma=2.0, lower=0.0)
         f_refreeze_prior = pm.TruncatedNormal(
             "f_refreeze", mu=0.5, sigma=0.2, lower=0.0, upper=1
@@ -678,17 +682,17 @@ if __name__ == "__main__":
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Hyperparameters (likelihood related priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        R_sigma = pm.HalfCauchy("R_sigma", 0.5)
-        A_sigma = pm.HalfCauchy("A_sigma", 2)
-        M_sigma = pm.HalfCauchy("M_sigma", 5)
+        R_sigma = pm.HalfNormal("R_sigma", 0.5)
+        A_sigma = pm.HalfNormal("A_sigma", 2)
+        M_sigma = pm.HalfNormal("M_sigma", 10)
 
-        sigma = tt.transpose(tt.stack([R_sigma, A_sigma, M_sigma]))
+        sigma = tt.transpose(tt.stack([A_sigma, M_sigma, R_sigma]))
 
     # Define Forward model (wrapped through theano)
     with model:
-        R, A, M = PDD_forward.forward(
-            T_obs,
-            P_obs,
+        A, M, R = PDD_forward.forward(
+            T_obs_norm,
+            P_obs_norm,
             std_dev,
             f_snow_prior,
             f_ice_prior,
@@ -697,7 +701,7 @@ if __name__ == "__main__":
         # net balance [m i.e. / yr ]
         B = A + R - M
 
-        mu = tt.transpose(tt.stack([R, A, M]))
+        mu = tt.transpose(tt.stack([A, M, R]))
 
     # Define likelihood (function?)
     with model:
@@ -708,9 +712,9 @@ if __name__ == "__main__":
             sigma=sigma,
             observed=np.array(
                 [
-                    R_obs.reshape(-1, 1),
                     A_obs.reshape(-1, 1),
                     M_obs.reshape(-1, 1),
+                    R_obs.reshape(-1, 1),
                 ],
             ),
         )
@@ -725,30 +729,36 @@ if __name__ == "__main__":
             return_inferencedata=True,
         )
 
-    az.plot_trace(trace)
+    axes = az.plot_trace(trace, ["f_snow", "f_ice", "f_refreeze"])
+    fig = axes.ravel()[0].figure
+    fig.savefig("nuts.pdf")
 
-    # run inference: Sample
-    with model:
-        approx = pm.fit(
-            draws, callbacks=[pm.callbacks.CheckParametersConvergence(tolerance=1e-4)]
-        )
+    # with model:
+    #     advi = pm.ADVI()
+    #     advi.approx.shared_params
+    #     tracker = pm.callbacks.Tracker(
+    #         mean=advi.approx.mean.eval,  # callable that returns mean
+    #         std=advi.approx.std.eval,  # callable that returns std
+    #     )
+    #     approx = advi.fit(draws, callbacks=[tracker])
 
-    means = approx.bij.rmap(approx.mean.eval())
-    sds = approx.bij.rmap(approx.std.eval())
-    import seaborn as sns
+    # with model:
+    #     approx = pm.fit(
+    #         draws,
+    #         method="svgd",
+    #         inf_kwargs=dict(n_particles=1000),
+    #         obj_optimizer=pm.sgd(learning_rate=0.01),
+    #     )
+    # means = approx.bij.rmap(approx.mean.eval())
+    # sds = approx.bij.rmap(approx.std.eval())
+    # import seaborn as sns
 
-    from scipy import stats
+    # from scipy import stats
 
-    varnames = means.keys()
-    fig, axs = plt.subplots(nrows=len(varnames), figsize=(12, 18))
-    for var, ax in zip(varnames, axs):
-        mu_arr = means[var]
-        sigma_arr = sds[var]
-        ax.set_title(var)
-        for i, (mu, sigma) in enumerate(zip(mu_arr.flatten(), sigma_arr.flatten())):
-            sd3 = (-4 * sigma + mu, 4 * sigma + mu)
-            x = np.linspace(sd3[0], sd3[1], 300)
-            y = stats.norm(mu, sigma).pdf(x)
-            ax.plot(x, y)
-    fig.tight_layout()
-    fig.savefig("test.pdf")
+    # fig = plt.figure()
+    # ax = fig.add_subplot(111)
+    # sns.kdeplot(approx.sample(10000)["f_snow"], label="snow", ax=ax)
+    # sns.kdeplot(approx.sample(10000)["f_ice"], label="ice", ax=ax)
+    # ax.set_xlim(0, 10)
+    # plt.legend()
+    # fig.savefig("advi.pdf")

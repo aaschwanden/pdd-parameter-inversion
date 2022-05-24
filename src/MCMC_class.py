@@ -1,3 +1,4 @@
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 import logging
 import torch
 import numpy as np
@@ -550,8 +551,8 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None, B_obs=None
     ):
 
-        f_snow = pyro.sample("f_snow", dist.Normal(4.1, 1))
-        f_ice = pyro.sample("f_ice", dist.Normal(8, 1))
+        f_snow = pyro.sample("f_snow", dist.Normal(3.2, 2))
+        f_ice = pyro.sample("f_ice", dist.Normal(8.0, 2))
         refreeze = pyro.sample("refreeze", dist.Normal(0.5, 0.2))
 
         pdd_model = TorchPDDModel(
@@ -561,21 +562,18 @@ class BayesianPDD(pyro.nn.module.PyroModule):
             refreeze_ice=refreeze,
         )
         result = pdd_model.forward(temp, precip, std_dev)
-        B = result["smb"]
         A = result["accu"]
         M = result["melt"]
         R = result["refreeze"]
 
         with pyro.plate("obs", use_cuda=self.use_cuda):
 
-            A_sigma = pyro.sample("A_sigma", dist.HalfCauchy(2))
+            A_sigma = pyro.sample("A_sigma", dist.Normal(2, 0.2))
             pyro.sample("A_est", dist.Normal(A, A_sigma).to_event(1), obs=A_obs)
-            M_sigma = pyro.sample("M_sigma", dist.HalfCauchy(5))
+            M_sigma = pyro.sample("M_sigma", dist.Normal(5, 0.5))
             pyro.sample("M_est", dist.Normal(M, M_sigma).to_event(1), obs=M_obs)
-            R_sigma = pyro.sample("R_sigma", dist.HalfCauchy(0.5))
+            R_sigma = pyro.sample("R_sigma", dist.Normal(0.5, 0.1))
             pyro.sample("R_est", dist.Normal(R, R_sigma).to_event(1), obs=R_obs)
-            B_sigma = pyro.sample("B_sigma", dist.HalfCauchy(5))
-            pyro.sample("B_est", dist.Normal(B, B_sigma).to_event(1), obs=B_obs)
 
             return {
                 "f_snow": f_snow,
@@ -587,16 +585,24 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None, B_obs=None
     ):
 
-        f_snow_loc = pyro.param("f_snow_loc", torch.tensor(4.1))
+        f_snow_loc = pyro.param(
+            "f_snow_loc",
+            torch.tensor(3.2),
+            constraint=constraints.interval(1.0, 6.0),
+        )
         f_snow_scale = pyro.param(
             "f_snow_scale",
-            torch.tensor(1),
+            torch.tensor(2),
             constraint=constraints.positive,
         )
 
-        f_ice_loc = pyro.param("f_ice_loc", torch.tensor(8.0))
+        f_ice_loc = pyro.param(
+            "f_ice_loc",
+            torch.tensor(8.0),
+            constraint=constraints.interval(1.0, 12.0),
+        )
         f_ice_scale = pyro.param(
-            "f_ice_scale", torch.tensor(1), constraint=constraints.positive
+            "f_ice_scale", torch.tensor(2), constraint=constraints.positive
         )
         refreeze_loc = pyro.param(
             "refreeze_loc",
@@ -639,7 +645,14 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         num_iters = 5000
         losses = []
         for i in range(num_iters):
-            elbo = svi.step(T_obs, P_obs, np.zeros_like(T_obs), A_obs, M_obs, R_obs)
+            elbo = svi.step(
+                T_obs,
+                P_obs,
+                np.zeros_like(T_obs),
+                A_obs=A_obs,
+                M_obs=M_obs,
+                R_obs=R_obs,
+            )
             losses.append(elbo)
             if i % 1000 == 0:
                 print(f"Iteration {i} loss: {elbo}")
@@ -649,11 +662,36 @@ class BayesianPDD(pyro.nn.module.PyroModule):
                 print(f"""{pyro.param("refreeze_loc").item():.2f}""")
 
 
-if __name__ == "__main__":
+def read_observation(file="../DMI-HIRHAM5_1980_MM.nc", thinning_factor=1):
+    """
+    Read and return Obs
+    """
 
-    pyro.clear_param_store()
+    with xr.open_dataset(file) as Obs:
 
-    n = 10
+        stacked = Obs.stack(z=("rlat", "rlon"))
+        ncl_stacked = Obs.stack(z=("ncl4", "ncl5"))
+
+        temp = stacked.tas.dropna(dim="z").values
+        rainfall = stacked.rainfall.dropna(dim="z").values / 1000
+        snowfall = stacked.snfall.dropna(dim="z").values / 1000
+        smb = stacked.gld.dropna(dim="z").values / 1000
+        refreeze = ncl_stacked.rfrz.dropna(dim="z").values / 1000
+        melt = stacked.snmel.dropna(dim="z").values / 1000
+        precip = rainfall + snowfall
+
+    return (
+        temp[..., ::thinning_factor],
+        precip[..., ::thinning_factor],
+        refreeze.sum(axis=0)[..., ::thinning_factor],
+        snowfall.sum(axis=0)[..., ::thinning_factor],
+        melt.sum(axis=0)[..., ::thinning_factor],
+        smb.sum(axis=0)[..., ::thinning_factor],
+    )
+
+
+def load_synth_climate():
+    n = 4
     m = 12
 
     lx = ly = 750000
@@ -676,19 +714,74 @@ if __name__ == "__main__":
     std_dev = stdv.reshape(m, -1)
     pdd = TorchPDDModel(
         pdd_factor_snow=3,
-        pdd_factor_ice=8,
+        pdd_factor_ice=10,
         refreeze_snow=0.0,
         refreeze_ice=0.0,
     )
+    std_dev = np.zeros_like(T_obs)
     result = pdd(T_obs, P_obs, std_dev)
 
-    B_obs = result["smb"]
     A_obs = result["accu"]
     M_obs = result["melt"]
     R_obs = result["refreeze"]
 
+    return T_obs, P_obs, std_dev, A_obs, M_obs, R_obs
+
+
+def load_hirham_climate():
+    (
+        T_obs,
+        P_obs,
+        R_obs,
+        A_obs,
+        M_obs,
+        B_obs,
+    ) = read_observation(thinning_factor=100)
+
+    T_obs -= 273.15
+    pdd = TorchPDDModel(
+        pdd_factor_snow=3,
+        pdd_factor_ice=10,
+        refreeze_snow=0.0,
+        refreeze_ice=0.0,
+    )
+    std_dev = np.zeros_like(T_obs)
+    result = pdd(T_obs, P_obs, std_dev)
+    A_obs = result["accu"]
+    M_obs = result["melt"]
+    R_obs = result["refreeze"]
+
+    return T_obs, P_obs, std_dev, A_obs, M_obs, R_obs
+
+
+if __name__ == "__main__":
+
+    parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.description = "Variational Inference of PDD parameters."
+    parser.add_argument(
+        "-c",
+        "--climate",
+        dest="climate",
+        choices=["hirham", "synth"],
+        help="Climate (temp, precip) forcing",
+        default="synth",
+    )
+    options = parser.parse_args()
+    climate = options.climate
+    pyro.clear_param_store()
+
+    if climate == "synth":
+        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs = load_synth_climate()
+    elif climate == "hirham":
+        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs = load_hirham_climate()
+    else:
+        print(f"Climate {climate} not recognized")
+
+    T_obs_norm = (T_obs - T_obs.mean()) / T_obs.std()
+    P_obs_norm = (P_obs - P_obs.mean()) / P_obs.std()
+
     model = BayesianPDD()
-    model.forward(T_obs, P_obs, std_dev, A_obs, M_obs, R_obs)
+    model.forward(T_obs_norm, P_obs_norm, std_dev, A_obs, M_obs, R_obs)
     print("Recovered parameters")
     for name, value in pyro.get_param_store().items():
         print(name, f"""{pyro.param(name).data.cpu().numpy():.2f}""")
@@ -718,7 +811,7 @@ if __name__ == "__main__":
         color="orange",
     )
     x = np.arange(0, 16, 0.001)
-    plt.plot(x, norm.pdf(x, 4.2, 1), lw=2, label="f_snow_prior")
-    plt.plot(x, norm.pdf(x, 8.0, 1), color="orange", lw=2, label="f_ice_prior")
+    plt.plot(x, norm.pdf(x, 4.2, 1), lw=3, label="f_snow_prior")
+    plt.plot(x, norm.pdf(x, 8.0, 1), color="orange", lw=3, label="f_ice_prior")
     plt.legend()
     plt.show()
