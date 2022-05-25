@@ -320,6 +320,7 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
         temp_rain=2.0,
         interpolate_rule="linear",
         interpolate_n=52,
+        device="cpu",
         *args,
         **kwargs,
     ):
@@ -334,6 +335,7 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
         self.temp_rain = temp_rain
         self.interpolate_rule = interpolate_rule
         self.interpolate_n = interpolate_n
+        self.device = device
 
     def forward(self, temp, prec, stdv=0.0):
         """Run the positive degree day model.
@@ -360,10 +362,11 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
         ('smb'), and many other output variables in a dictionary.
         """
 
+        device = self.device
         # ensure numpy arrays
-        temp = torch.asarray(temp)
-        prec = torch.asarray(prec)
-        stdv = torch.asarray(stdv)
+        temp = torch.asarray(temp, device=device)
+        prec = torch.asarray(prec, device=device)
+        stdv = torch.asarray(stdv, device=device)
 
         # expand arrays to the largest shape
         maxshape = max(temp.shape, prec.shape, stdv.shape)
@@ -453,12 +456,12 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
 
         rule = self.interpolate_rule
         npts = self.interpolate_n
-        oldx = (torch.arange(len(array) + 2) - 0.5) / len(array)
+        oldx = (torch.arange(len(array) + 2, device=self.device) - 0.5) / len(array)
         oldy = torch.vstack((array[-1], array, array[0]))
         newx = (torch.arange(npts) + 0.5) / npts  # use 0.0 for PISM-like behaviour
-        newy = interp1d(oldx, oldy, kind=rule, axis=0)(newx)
+        newy = interp1d(oldx.cpu(), oldy.cpu(), kind=rule, axis=0)(newx)
 
-        return torch.from_numpy(newy)
+        return torch.from_numpy(newy).to(self.device)
 
     def inst_pdd(self, temp, stdv):
         """Compute instantaneous positive degree days from temperature.
@@ -539,27 +542,32 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
 
 
 class BayesianPDD(pyro.nn.module.PyroModule):
-    def __init__(self, use_cuda=False):
+    def __init__(self, device="cpu"):
         super().__init__()
-        if use_cuda:
+        if device == "cuda":
             # calling cuda() here will put all the parameters of
             # the encoder and decoder networks into gpu memory
             self.cuda()
+            use_cuda = True
+        else:
+            use_cuda = False
         self.use_cuda = use_cuda
+        self.device = device
 
     def model(
         self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None, B_obs=None
     ):
 
-        f_snow = pyro.sample("f_snow", dist.Normal(3.2, 2))
-        f_ice = pyro.sample("f_ice", dist.Normal(8.0, 2))
-        refreeze = pyro.sample("refreeze", dist.Normal(0.5, 0.2))
+        f_snow = pyro.sample("f_snow", dist.Normal(3.0, 1)).to(self.device)
+        f_ice = pyro.sample("f_ice", dist.Normal(8.0, 1.5)).to(self.device)
+        f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2)).to(self.device)
 
         pdd_model = TorchPDDModel(
             pdd_factor_snow=f_snow,
             pdd_factor_ice=f_ice,
-            refreeze_snow=refreeze,
-            refreeze_ice=refreeze,
+            refreeze_snow=f_refreeze,
+            refreeze_ice=f_refreeze,
+            device=self.device,
         )
         result = pdd_model.forward(temp, precip, std_dev)
         A = result["accu"]
@@ -568,17 +576,16 @@ class BayesianPDD(pyro.nn.module.PyroModule):
 
         with pyro.plate("obs", use_cuda=self.use_cuda):
 
-            A_sigma = pyro.sample("A_sigma", dist.Normal(2, 0.2))
+            A_sigma = pyro.sample("A_sigma", dist.Normal(2, 0.2)).to(self.device)
             pyro.sample("A_est", dist.Normal(A, A_sigma).to_event(1), obs=A_obs)
-            M_sigma = pyro.sample("M_sigma", dist.Normal(5, 0.5))
+            M_sigma = pyro.sample("M_sigma", dist.Normal(5, 1.0)).to(self.device)
             pyro.sample("M_est", dist.Normal(M, M_sigma).to_event(1), obs=M_obs)
-            R_sigma = pyro.sample("R_sigma", dist.Normal(0.5, 0.1))
+            R_sigma = pyro.sample("R_sigma", dist.Normal(0.5, 0.1)).to(self.device)
             pyro.sample("R_est", dist.Normal(R, R_sigma).to_event(1), obs=R_obs)
-
             return {
                 "f_snow": f_snow,
                 "f_ice": f_ice,
-                "refreeze": refreeze,
+                "refreeze": f_refreeze,
             }
 
     def guide(
@@ -587,50 +594,53 @@ class BayesianPDD(pyro.nn.module.PyroModule):
 
         f_snow_loc = pyro.param(
             "f_snow_loc",
-            torch.tensor(3.2),
+            torch.tensor(3.0),
             constraint=constraints.interval(1.0, 6.0),
-        )
+        ).to(self.device)
         f_snow_scale = pyro.param(
             "f_snow_scale",
-            torch.tensor(2),
+            torch.tensor(1.0),
             constraint=constraints.positive,
-        )
+        ).to(self.device)
 
         f_ice_loc = pyro.param(
             "f_ice_loc",
             torch.tensor(8.0),
             constraint=constraints.interval(1.0, 12.0),
-        )
+        ).to(self.device)
         f_ice_scale = pyro.param(
-            "f_ice_scale", torch.tensor(2), constraint=constraints.positive
-        )
-        refreeze_loc = pyro.param(
-            "refreeze_loc",
+            "f_ice_scale", torch.tensor(1.5), constraint=constraints.positive
+        ).to(self.device)
+
+        f_refreeze_loc = pyro.param(
+            "f_refreeze_loc",
             torch.tensor(0.5),
             constraint=constraints.interval(0.0, 1.0),
-        )
-        refreeze_scale = pyro.param(
-            "refreeze_scale",
+        ).to(self.device)
+        f_refreeze_scale = pyro.param(
+            "f_refreeze_scale",
             lambda: torch.tensor(0.25),
             constraint=constraints.positive,
-        )
+        ).to(self.device)
 
         f_snow = pyro.sample("f_snow", dist.Normal(f_snow_loc, f_snow_scale))
         f_ice = pyro.sample("f_ice", dist.Normal(f_ice_loc, f_ice_scale))
-        refreeze = pyro.sample("refreeze", dist.Normal(refreeze_loc, refreeze_scale))
-
+        f_refreeze = pyro.sample(
+            "f_refreeze", dist.Normal(f_refreeze_loc, f_refreeze_scale)
+        )
         pdd_model = TorchPDDModel(
             pdd_factor_snow=f_snow,
             pdd_factor_ice=f_ice,
-            refreeze_snow=refreeze,
-            refreeze_ice=refreeze,
+            refreeze_snow=f_refreeze,
+            refreeze_ice=f_refreeze,
+            device=self.device,
         )
 
         result = pdd_model.forward(temp, precip, std_dev)
         return {
             "f_snow": f_snow,
             "f_ice": f_ice,
-            "refreeze": refreeze,
+            "refreeze": f_refreeze,
         }
 
     def forward(
@@ -638,28 +648,34 @@ class BayesianPDD(pyro.nn.module.PyroModule):
     ):
 
         pyro.clear_param_store()
-        adam = pyro.optim.Adam({"lr": 0.1})  # Consider decreasing learning rate.
+        adam = pyro.optim.Adam({"lr": 0.01})  # Consider decreasing learning rate.
         elbo = pyro.infer.Trace_ELBO()
         print("Setting up SVI")
         svi = pyro.infer.SVI(model.model, model.guide, adam, elbo)
-        num_iters = 5000
+        optimizer = torch.optim.Adam
+        scheduler = pyro.optim.ExponentialLR(
+            {"optimizer": optimizer, "optim_args": {"lr": 0.1}, "gamma": 0.995}
+        )
+        svi = pyro.infer.SVI(model.model, model.guide, scheduler, elbo)
+        num_iters = 10000
         losses = []
         for i in range(num_iters):
             elbo = svi.step(
                 T_obs,
                 P_obs,
-                np.zeros_like(T_obs),
+                std_dev,
                 A_obs=A_obs,
                 M_obs=M_obs,
                 R_obs=R_obs,
             )
+            scheduler.step()
             losses.append(elbo)
             if i % 1000 == 0:
                 print(f"Iteration {i} loss: {elbo}")
                 logging.info("Elbo loss: {}".format(elbo))
-                print(f"""{pyro.param("f_snow_loc").item():.2f}""")
-                print(f"""{pyro.param("f_ice_loc").item():.2f}""")
-                print(f"""{pyro.param("refreeze_loc").item():.2f}""")
+                # print(f"""f_snow={pyro.param("f_snow_loc").item():.2f}""")
+                # print(f"""f_ice={pyro.param("f_ice_loc").item():.2f}""")
+                # print(f"""f_refreeze={pyro.param("f_refreeze_loc").item():.2f}""")
 
 
 def read_observation(file="../DMI-HIRHAM5_1980_MM.nc", thinning_factor=1):
@@ -690,8 +706,8 @@ def read_observation(file="../DMI-HIRHAM5_1980_MM.nc", thinning_factor=1):
     )
 
 
-def load_synth_climate():
-    n = 4
+def load_synth_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
+    n = 5
     m = 12
 
     lx = ly = 750000
@@ -713,10 +729,11 @@ def load_synth_climate():
     P_obs = prec.reshape(m, -1)
     std_dev = stdv.reshape(m, -1)
     pdd = TorchPDDModel(
-        pdd_factor_snow=3,
-        pdd_factor_ice=10,
-        refreeze_snow=0.0,
-        refreeze_ice=0.0,
+        pdd_factor_snow=f_snow,
+        pdd_factor_ice=f_ice,
+        refreeze_snow=f_refreeze,
+        refreeze_ice=f_refreeze,
+        device=device,
     )
     std_dev = np.zeros_like(T_obs)
     result = pdd(T_obs, P_obs, std_dev)
@@ -725,10 +742,17 @@ def load_synth_climate():
     M_obs = result["melt"]
     R_obs = result["refreeze"]
 
-    return T_obs, P_obs, std_dev, A_obs, M_obs, R_obs
+    return (
+        torch.from_numpy(T_obs).to(device),
+        torch.from_numpy(P_obs).to(device),
+        torch.from_numpy(std_dev).to(device),
+        A_obs,
+        M_obs,
+        R_obs,
+    )
 
 
-def load_hirham_climate():
+def load_hirham_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
     (
         T_obs,
         P_obs,
@@ -740,10 +764,11 @@ def load_hirham_climate():
 
     T_obs -= 273.15
     pdd = TorchPDDModel(
-        pdd_factor_snow=3,
-        pdd_factor_ice=10,
-        refreeze_snow=0.0,
-        refreeze_ice=0.0,
+        pdd_factor_snow=f_snow,
+        pdd_factor_ice=f_ice,
+        refreeze_snow=f_refreeze,
+        refreeze_ice=f_refreeze,
+        devic=device,
     )
     std_dev = np.zeros_like(T_obs)
     result = pdd(T_obs, P_obs, std_dev)
@@ -751,7 +776,14 @@ def load_hirham_climate():
     M_obs = result["melt"]
     R_obs = result["refreeze"]
 
-    return T_obs, P_obs, std_dev, A_obs, M_obs, R_obs
+    return (
+        torch.from_numpy(T_obs).to(device),
+        torch.from_numpy(P_obs).to(device),
+        torch.from_numpy(std_dev).to(device),
+        A_obs,
+        M_obs,
+        R_obs,
+    )
 
 
 if __name__ == "__main__":
@@ -766,21 +798,31 @@ if __name__ == "__main__":
         help="Climate (temp, precip) forcing",
         default="synth",
     )
+    parser.add_argument(
+        "-d",
+        "--device",
+        dest="device",
+        help="Device (cpu, cuda)",
+        default="cpu",
+    )
     options = parser.parse_args()
     climate = options.climate
+    device = options.device
     pyro.clear_param_store()
 
     if climate == "synth":
-        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs = load_synth_climate()
+        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs = load_synth_climate(
+            f_refreeze=0.6, device=device
+        )
     elif climate == "hirham":
-        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs = load_hirham_climate()
+        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs = load_hirham_climate(device=device)
     else:
         print(f"Climate {climate} not recognized")
 
     T_obs_norm = (T_obs - T_obs.mean()) / T_obs.std()
     P_obs_norm = (P_obs - P_obs.mean()) / P_obs.std()
 
-    model = BayesianPDD()
+    model = BayesianPDD(device=device)
     model.forward(T_obs_norm, P_obs_norm, std_dev, A_obs, M_obs, R_obs)
     print("Recovered parameters")
     for name, value in pyro.get_param_store().items():
@@ -802,16 +844,20 @@ if __name__ == "__main__":
 
     fig = plt.figure(figsize=(10, 6))
 
-    sns.histplot(fs.detach().cpu().numpy(), kde=True, stat="density", label="f_snow")
+    sns.histplot(
+        fs.detach().cpu().numpy(), kde=True, stat="density", label="f_snow_posterior"
+    )
     sns.histplot(
         fi.detach().cpu().numpy(),
         kde=True,
         stat="density",
-        label="f_ice",
+        label="f_ice_posterior",
         color="orange",
     )
     x = np.arange(0, 16, 0.001)
-    plt.plot(x, norm.pdf(x, 4.2, 1), lw=3, label="f_snow_prior")
-    plt.plot(x, norm.pdf(x, 8.0, 1), color="orange", lw=3, label="f_ice_prior")
+    plt.plot(x, norm.pdf(x, 4.2, 1), lw=2, ls="dotted", label="f_snow_prior")
+    plt.plot(
+        x, norm.pdf(x, 8.0, 1), color="orange", lw=2, ls="dotted", label="f_ice_prior"
+    )
     plt.legend()
     plt.show()
