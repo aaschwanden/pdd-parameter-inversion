@@ -309,6 +309,7 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         A = result["accu"]
         M = result["melt"]
         R = result["refreeze"]
+        B = result["smb"]
 
         with pyro.plate("obs", use_cuda=self.use_cuda):
 
@@ -318,6 +319,8 @@ class BayesianPDD(pyro.nn.module.PyroModule):
             pyro.sample("M_est", dist.Normal(M, M_sigma).to_event(1), obs=M_obs)
             R_sigma = pyro.sample("R_sigma", dist.Normal(0.5, 0.1)).to(self.device)
             pyro.sample("R_est", dist.Normal(R, R_sigma).to_event(1), obs=R_obs)
+            # B_sigma = pyro.sample("B_sigma", dist.Normal(2, 0.2)).to(self.device)
+            # pyro.sample("B_est", dist.Normal(B, B_sigma).to_event(1), obs=B_obs)
             return {
                 "f_snow": f_snow,
                 "f_ice": f_ice,
@@ -401,6 +404,7 @@ class BayesianPDD(pyro.nn.module.PyroModule):
                 A_obs=A_obs,
                 M_obs=M_obs,
                 R_obs=R_obs,
+                B_obs=R_obs,
             )
             scheduler.step()
             losses.append(elbo)
@@ -438,6 +442,10 @@ def read_observation(file="../data/DMI-HIRHAM5_1980_MM.nc", thinning_factor=1):
 
 
 def load_synth_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
+    """
+    Create a synthetic climate with monthly values
+
+    """
     n = 10
     m = 12
 
@@ -472,6 +480,7 @@ def load_synth_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
     A_obs = result["accu"]
     M_obs = result["melt"]
     R_obs = result["refreeze"]
+    B_obs = result["smb"]
 
     return (
         torch.from_numpy(T_obs).to(device),
@@ -480,6 +489,7 @@ def load_synth_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
         A_obs,
         M_obs,
         R_obs,
+        B_obs,
     )
 
 
@@ -503,9 +513,6 @@ def load_hirham_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
     )
     std_dev = np.zeros_like(T_obs)
     result = pdd(T_obs, P_obs, std_dev)
-    # A_obs = result["accu"]
-    # M_obs = result["melt"]
-    # R_obs = result["refreeze"]
 
     return (
         torch.from_numpy(T_obs).to(device),
@@ -514,6 +521,7 @@ def load_hirham_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
         torch.from_numpy(A_obs).to(device),
         torch.from_numpy(M_obs).to(device),
         torch.from_numpy(R_obs).to(device),
+        torch.from_numpy(B_obs).to(device),
     )
 
 
@@ -561,11 +569,11 @@ if __name__ == "__main__":
     print("-------------------------------------------")
 
     if climate == "synth":
-        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs = load_synth_climate(
+        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs, B_obs = load_synth_climate(
             f_snow=fs, f_ice=fi, f_refreeze=fr, device=device
         )
     elif climate == "hirham":
-        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs = load_hirham_climate(
+        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs, B_obs = load_hirham_climate(
             f_snow=fs, f_ice=fi, f_refreeze=fr, device=device
         )
     else:
@@ -584,7 +592,14 @@ if __name__ == "__main__":
     )
 
     model = BayesianPDD(device=device, max_epochs=max_epochs)
-    model.forward(T_obs, P_obs, std_dev, A_obs=A_obs, M_obs=M_obs, R_obs=R_obs)
+    model.forward(
+        T_obs,
+        P_obs,
+        std_dev,
+        A_obs=A_obs,
+        M_obs=M_obs,
+        R_obs=R_obs,
+    )
     print("Recovered parameters")
     for name, value in pyro.get_param_store().items():
         print(name, f"""{pyro.param(name).data.cpu().numpy():.2f}""")
