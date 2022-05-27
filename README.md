@@ -1,1 +1,2 @@
-# summer-school-2022
+# Variational Parameter Estimation
+
