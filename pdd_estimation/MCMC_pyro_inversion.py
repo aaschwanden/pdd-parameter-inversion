@@ -386,16 +386,21 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
         inst_pdd = self.inst_pdd(temp, stdv)
 
         # initialize snow depth, melt and refreeze rates
-        snow_depth = torch.zeros_like(temp)
+        snow_depth = torch.zeros_like(temp, requires_grad=True)
         snow_melt_rate = torch.zeros_like(temp)
         ice_melt_rate = torch.zeros_like(temp)
         snow_refreeze_rate = torch.zeros_like(temp)
         ice_refreeze_rate = torch.zeros_like(temp)
 
-        snow_depth[:-1] = torch.clone(snow_depth[1:])
-        snow_depth = torch.clone(snow_depth) + accu_rate
-        snow_melt_rate, ice_melt_rate = self.melt_rates(snow_depth, inst_pdd)
-        snow_depth = torch.clone(snow_depth) - snow_melt_rate
+        # compute snow depth and melt rates
+        for i in range(len(temp)):
+            if i > 0:
+                snow_depth[i] = snow_depth[i - 1]
+            snow_depth[i] = torch.clone(snow_depth[i]) + accu_rate[i]
+            snow_melt_rate[i], ice_melt_rate[i] = self.melt_rates(
+                snow_depth[i], inst_pdd[i]
+            )
+            snow_depth[i] = snow_depth[i] - snow_melt_rate[i]
 
         melt_rate = snow_melt_rate + ice_melt_rate
         snow_refreeze_rate = self.refreeze_snow * snow_melt_rate
@@ -825,9 +830,9 @@ if __name__ == "__main__":
     max_epochs = options.max_epochs
     pyro.clear_param_store()
 
-    fs = 3
+    fs = 4
     fi = 12
-    fr = 0.2
+    fr = 0.25
 
     print("-------------------------------------------")
     print("Variantional Inference of PDD parameters")
