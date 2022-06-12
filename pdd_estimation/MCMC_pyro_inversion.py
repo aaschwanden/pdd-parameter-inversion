@@ -840,10 +840,34 @@ if __name__ == "__main__":
         type=int,
         default=10000,
     )
+    parser.add_argument(
+        "--f_snow_loc",
+        dest="f_snow_loc",
+        help="f_snow prior",
+        type=float,
+        default=3.,
+    )
+    parser.add_argument(
+        "--f_ice_loc",
+        dest="f_ice_loc",
+        help="f_ice prior",
+        type=float,
+        default=8.,
+    )
+    parser.add_argument(
+        "--f_refreeze_loc",
+        dest="f_refreeze_loc",
+        help="f_refreeze prior",
+        type=float,
+        default=0.5,
+    )
     options = parser.parse_args()
     climate = options.climate
     device = options.device
     max_epochs = options.max_epochs
+    f_snow_loc = options.f_snow_loc
+    f_ice_loc = options.f_ice_loc
+    f_refreeze_loc = options.f_refreeze_loc
     pyro.clear_param_store()
 
     fs = 2.6
@@ -855,7 +879,10 @@ if __name__ == "__main__":
     print("-------------------------------------------\n")
     print("Trying to recover:")
     print(f"f_snow={fs}, f_ice={fi}, f_refreeze={fr}\n")
-    print("-------------------------------------------")
+    print("-------------------------------------------\n")
+    print("Priors given:")
+    print(f"f_snow={f_snow_loc}, f_ice={f_ice_loc}, f_refreeze={f_refreeze_loc}\n")
+    
 
     if climate == "synth":
         T_obs, P_obs, std_dev, A_obs, M_obs, R_obs, B_obs = load_synth_climate(
@@ -880,7 +907,7 @@ if __name__ == "__main__":
         / std_dev.std(axis=1).reshape(-1, 1)
     )
 
-    model = BayesianPDD(device=device, max_epochs=max_epochs)
+    model = BayesianPDD(device=device, max_epochs=max_epochs,f_snow_loc=f_snow_loc, f_ice_loc=f_ice_loc, f_refreeze_loc=f_refreeze_loc)
     loss = model.forward(
         T_obs,
         P_obs,
