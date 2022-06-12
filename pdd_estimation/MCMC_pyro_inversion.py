@@ -560,7 +560,8 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
 
 
 class BayesianPDD(pyro.nn.module.PyroModule):
-    def __init__(self, max_epochs=10000, device="cpu"):
+    def __init__(self, max_epochs=10000, device="cpu", f_snow_loc=3, f_snow_scale=1, f_ice_loc=8, f_ice_scale=1.5, f_refreeze_loc=0.5,
+                f_refreeze_scale=0.2):
         super().__init__()
         if device == "cuda":
             # calling cuda() here will put all the parameters of
@@ -572,14 +573,20 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         self.use_cuda = use_cuda
         self.device = device
         self.max_epochs = max_epochs
+        self.f_snow_loc=f_snow_loc
+        self.f_snow_scale=f_snow_scale
+        self.f_ice_loc=f_ice_loc
+        self.f_ice_scale=f_ice_scale
+        self.f_refreeze_loc=f_refreeze_loc
+        self.f_refreeze_scale=f_refreeze_scale
 
     def model(
         self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None, B_obs=None
     ):
 
-        f_snow = pyro.sample("f_snow", dist.Normal(3.0, 1.0)).to(self.device)
-        f_ice = pyro.sample("f_ice", dist.Normal(8.0, 1.5)).to(self.device)
-        f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2)).to(self.device)
+        f_snow = pyro.sample("f_snow", dist.Normal(self.f_snow_loc, self.f_snow_scale)).to(self.device)
+        f_ice = pyro.sample("f_ice", dist.Normal(self.f_ice_loc, self.f_ice_scale)).to(self.device)
+        f_refreeze = pyro.sample("f_refreeze", dist.Normal(self.f_refreeze_loc, self.f_refreeze_scale)).to(self.device)
 
         pdd_model = TorchPDDModel(
             pdd_factor_snow=f_snow,
@@ -614,32 +621,32 @@ class BayesianPDD(pyro.nn.module.PyroModule):
 
         f_snow_loc = pyro.param(
             "f_snow_loc",
-            torch.tensor(3.0),
+            torch.tensor(self.f_snow_loc),
             constraint=constraints.interval(1.0, 8.0),
         ).to(self.device)
         f_snow_scale = pyro.param(
             "f_snow_scale",
-            torch.tensor(1.0),
+            torch.tensor(self.f_snow_scale),
             constraint=constraints.positive,
         ).to(self.device)
 
         f_ice_loc = pyro.param(
             "f_ice_loc",
-            torch.tensor(8.0),
+            torch.tensor(self.f_ice_loc),
             constraint=constraints.interval(1.0, 16.0),
         ).to(self.device)
         f_ice_scale = pyro.param(
-            "f_ice_scale", torch.tensor(1.5), constraint=constraints.positive
+            "f_ice_scale", torch.tensor(self.f_ice_scale), constraint=constraints.positive
         ).to(self.device)
 
         f_refreeze_loc = pyro.param(
             "f_refreeze_loc",
-            torch.tensor(0.5),
+            torch.tensor(self.f_refreeze_loc),
             constraint=constraints.interval(0.0, 1.0),
         ).to(self.device)
         f_refreeze_scale = pyro.param(
             "f_refreeze_scale",
-            lambda: torch.tensor(0.2),
+            lambda: torch.tensor(self.f_refreeze_scale),
             constraint=constraints.positive,
         ).to(self.device)
 
