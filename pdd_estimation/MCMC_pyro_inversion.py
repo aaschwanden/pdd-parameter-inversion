@@ -386,21 +386,33 @@ class TorchPDDModel(pyro.nn.module.PyroModule):
         inst_pdd = self.inst_pdd(temp, stdv)
 
         # initialize snow depth, melt and refreeze rates
-        snow_depth = torch.zeros_like(temp, requires_grad=True)
+        snow_depth = torch.zeros_like(temp)
         snow_melt_rate = torch.zeros_like(temp)
         ice_melt_rate = torch.zeros_like(temp)
         snow_refreeze_rate = torch.zeros_like(temp)
         ice_refreeze_rate = torch.zeros_like(temp)
 
-        # compute snow depth and melt rates
-        for i in range(len(temp)):
-            if i > 0:
-                snow_depth[i] = snow_depth[i - 1]
-            snow_depth[i] = torch.clone(snow_depth[i]) + accu_rate[i]
-            snow_melt_rate[i], ice_melt_rate[i] = self.melt_rates(
-                snow_depth[i], inst_pdd[i]
-            )
-            snow_depth[i] = snow_depth[i] - snow_melt_rate[i]
+        sd_changes = torch.stack(
+            [
+                (snow_depth[i - 1] + accu_rate[i])
+                - self.melt_rates(snow_depth[i - 1] + accu_rate[i], inst_pdd[i])[0]
+                for i in range(len(temp))
+            ]
+        )
+
+        snow_melt_rate = torch.stack(
+            [
+                self.melt_rates(snow_depth[i - 1] + accu_rate[i], inst_pdd[i])[0]
+                for i in range(len(temp))
+            ]
+        )
+        ice_melt_rate = torch.stack(
+            [
+                self.melt_rates(snow_depth[i - 1] + accu_rate[i], inst_pdd[i])[1]
+                for i in range(len(temp))
+            ]
+        )
+        snow_depth = [sd_changes[0 : i + 1].sum(0) for i in range(len(temp)) if i > 0]
 
         melt_rate = snow_melt_rate + ice_melt_rate
         snow_refreeze_rate = self.refreeze_snow * snow_melt_rate
@@ -590,8 +602,6 @@ class BayesianPDD(pyro.nn.module.PyroModule):
             pyro.sample("M_est", dist.Normal(M, M_sigma).to_event(1), obs=M_obs)
             R_sigma = pyro.sample("R_sigma", dist.Normal(0.5, 0.1)).to(self.device)
             pyro.sample("R_est", dist.Normal(R, R_sigma).to_event(1), obs=R_obs)
-            # B_sigma = pyro.sample("B_sigma", dist.Normal(2, 0.2)).to(self.device)
-            # pyro.sample("B_est", dist.Normal(B, B_sigma).to_event(1), obs=B_obs)
             return {
                 "f_snow": f_snow,
                 "f_ice": f_ice,
@@ -675,11 +685,10 @@ class BayesianPDD(pyro.nn.module.PyroModule):
                 A_obs=A_obs,
                 M_obs=M_obs,
                 R_obs=R_obs,
-                B_obs=R_obs,
             )
             scheduler.step()
             losses.append(elbo)
-            if i % 1000 == 0:
+            if i % 100 == 0:
                 print(f"Iteration {i} loss: {elbo}")
                 logging.info("Elbo loss: {}".format(elbo))
 
@@ -770,11 +779,11 @@ def load_hirham_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
     (
         T_obs,
         P_obs,
-        R_obs,
         A_obs,
         M_obs,
+        R_obs,
         B_obs,
-    ) = read_observation(thinning_factor=100)
+    ) = read_observation(thinning_factor=10)
 
     T_obs -= 273.15
     pdd = TorchPDDModel(
@@ -830,7 +839,7 @@ if __name__ == "__main__":
     max_epochs = options.max_epochs
     pyro.clear_param_store()
 
-    fs = 4
+    fs = 2.6
     fi = 12
     fr = 0.25
 
