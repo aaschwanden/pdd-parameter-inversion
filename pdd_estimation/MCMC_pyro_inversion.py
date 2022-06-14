@@ -10,7 +10,12 @@ import pyro.distributions.constraints as constraints
 import pyro.poutine as poutine
 from scipy.interpolate import interp1d
 
+import pandas as pd
+from scipy.stats.distributions import truncnorm, gamma, uniform, randint
+from pyDOE import lhs
+
 torch.autograd.set_detect_anomaly(True)
+np.random.seed(2)
 
 
 class PDDModel(object):
@@ -573,11 +578,9 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         self.device = device
         self.max_epochs = max_epochs
 
-    def model(
-        self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None, B_obs=None
-    ):
+    def model(self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None):
 
-        f_snow = pyro.sample("f_snow", dist.Normal(3.0, 1.0)).to(self.device)
+        f_snow = pyro.sample("f_snow", dist.Normal(3.0, 0.75)).to(self.device)
         f_ice = pyro.sample("f_ice", dist.Normal(8.0, 1.5)).to(self.device)
         f_refreeze = pyro.sample("f_refreeze", dist.Normal(0.5, 0.2)).to(self.device)
 
@@ -592,15 +595,14 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         A = result["accu"]
         M = result["melt"]
         R = result["refreeze"]
-        B = result["smb"]
 
         with pyro.plate("obs", use_cuda=self.use_cuda):
 
-            A_sigma = pyro.sample("A_sigma", dist.Normal(2, 0.2)).to(self.device)
+            A_sigma = pyro.sample("A_sigma", dist.Normal(1, 0.2)).to(self.device)
             pyro.sample("A_est", dist.Normal(A, A_sigma).to_event(1), obs=A_obs)
             M_sigma = pyro.sample("M_sigma", dist.Normal(5, 1.0)).to(self.device)
             pyro.sample("M_est", dist.Normal(M, M_sigma).to_event(1), obs=M_obs)
-            R_sigma = pyro.sample("R_sigma", dist.Normal(0.5, 0.1)).to(self.device)
+            R_sigma = pyro.sample("R_sigma", dist.Normal(5, 1.0)).to(self.device)
             pyro.sample("R_est", dist.Normal(R, R_sigma).to_event(1), obs=R_obs)
             return {
                 "f_snow": f_snow,
@@ -608,9 +610,7 @@ class BayesianPDD(pyro.nn.module.PyroModule):
                 "f_refreeze": f_refreeze,
             }
 
-    def guide(
-        self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None, B_obs=None
-    ):
+    def guide(self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None):
 
         f_snow_loc = pyro.param(
             "f_snow_loc",
@@ -648,31 +648,20 @@ class BayesianPDD(pyro.nn.module.PyroModule):
         f_refreeze = pyro.sample(
             "f_refreeze", dist.Normal(f_refreeze_loc, f_refreeze_scale)
         )
-        pdd_model = TorchPDDModel(
-            pdd_factor_snow=f_snow,
-            pdd_factor_ice=f_ice,
-            refreeze_snow=f_refreeze,
-            refreeze_ice=f_refreeze,
-            device=self.device,
-        )
-
-        result = pdd_model.forward(temp, precip, std_dev)
         return {
             "f_snow": f_snow,
             "f_ice": f_ice,
             "f_refreeze": f_refreeze,
         }
 
-    def forward(
-        self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None, B_obs=None
-    ):
+    def forward(self, temp, precip, std_dev, A_obs=None, M_obs=None, R_obs=None):
 
         pyro.clear_param_store()
         print("Setting up SVI")
         optimizer = torch.optim.Adam
         elbo = pyro.infer.Trace_ELBO()
         scheduler = pyro.optim.ExponentialLR(
-            {"optimizer": optimizer, "optim_args": {"lr": 0.1}, "gamma": 0.999}
+            {"optimizer": optimizer, "optim_args": {"lr": 0.1}, "gamma": 0.99}
         )
         svi = pyro.infer.SVI(model.model, model.guide, scheduler, elbo)
         max_epochs = self.max_epochs
@@ -689,8 +678,8 @@ class BayesianPDD(pyro.nn.module.PyroModule):
             scheduler.step()
             losses.append(elbo)
             if i % 100 == 0:
-                print(f"Iteration {i} loss: {elbo}")
-                logging.info("Elbo loss: {}".format(elbo))
+                print(f"Iteration {i} loss: {elbo:.2f}")
+                logging.info(f"Elbo loss: {elbo}")
 
         return losses
 
@@ -706,11 +695,11 @@ def read_observation(file="../data/DMI-HIRHAM5_1980_MM.nc", thinning_factor=1):
         ncl_stacked = Obs.stack(z=("ncl4", "ncl5"))
 
         temp = stacked.tas.dropna(dim="z").values
-        rainfall = stacked.rainfall.dropna(dim="z").values / 1000
-        snowfall = stacked.snfall.dropna(dim="z").values / 1000
-        smb = stacked.gld.dropna(dim="z").values / 1000
-        refreeze = ncl_stacked.rfrz.dropna(dim="z").values / 1000
-        melt = stacked.snmel.dropna(dim="z").values / 1000
+        rainfall = stacked.rainfall.dropna(dim="z").values
+        snowfall = stacked.snfall.dropna(dim="z").values
+        smb = stacked.gld.dropna(dim="z").values
+        refreeze = ncl_stacked.rfrz.dropna(dim="z").values
+        melt = stacked.snmel.dropna(dim="z").values
         precip = rainfall + snowfall
 
     return (
@@ -833,122 +822,157 @@ if __name__ == "__main__":
         type=int,
         default=10000,
     )
+    parser.add_argument(
+        "--n_samples",
+        help="Number of samples.",
+        type=int,
+        default=3,
+    )
     options = parser.parse_args()
     climate = options.climate
     device = options.device
     max_epochs = options.max_epochs
+    n_samples = options.n_samples
     pyro.clear_param_store()
 
-    fs = 2.6
-    fi = 12
-    fr = 0.25
+    distributions = {
+        "f_snow": uniform(loc=2.0, scale=3.0),
+        "f_ice": uniform(loc=4, scale=8),
+        "f_refreeze": uniform(loc=0.0, scale=1.0),
+    }
 
-    print("-------------------------------------------")
-    print("Variantional Inference of PDD parameters")
-    print("-------------------------------------------\n")
-    print("Trying to recover:")
-    print(f"f_snow={fs}, f_ice={fi}, f_refreeze={fr}\n")
-    print("-------------------------------------------")
+    # Names of all the variables
+    keys = [x for x in distributions.keys()]
 
-    if climate == "synth":
-        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs, B_obs = load_synth_climate(
-            f_snow=fs, f_ice=fi, f_refreeze=fr, device=device
-        )
-    elif climate == "hirham":
-        T_obs, P_obs, std_dev, A_obs, M_obs, R_obs, B_obs = load_hirham_climate(
-            f_snow=fs, f_ice=fi, f_refreeze=fr, device=device
-        )
-    else:
-        print(f"Climate {climate} not recognized")
+    # Describe the Problem
+    problem = {"num_vars": len(keys), "names": keys, "bounds": [[0, 1]] * len(keys)}
 
-    # Normalization does not seem to improve convergence
-    T_obs_norm = (T_obs - T_obs.mean(axis=1).reshape(-1, 1)) / T_obs.std(
-        axis=1
-    ).reshape(-1, 1)
-    P_obs_norm = (P_obs - P_obs.mean(axis=1).reshape(-1, 1)) / P_obs.std(
-        axis=1
-    ).reshape(-1, 1)
-    std_dev_norm = torch.nan_to_num(
-        (std_dev - std_dev.mean(axis=1).reshape(-1, 1))
-        / std_dev.std(axis=1).reshape(-1, 1)
-    )
+    unif_sample = lhs(len(keys), n_samples)
 
-    model = BayesianPDD(device=device, max_epochs=max_epochs)
-    loss = model.forward(
-        T_obs,
-        P_obs,
-        std_dev,
-        A_obs=A_obs,
-        M_obs=M_obs,
-        R_obs=R_obs,
-    )
-    print("Recovered parameters")
-    for name, value in pyro.get_param_store().items():
-        print(name, f"""{pyro.param(name).data.cpu().numpy():.2f}""")
+    # To hold the transformed variables
+    dist_sample = np.zeros_like(unif_sample)
 
-    with pyro.plate("samples", T_obs.shape[1], dim=-1):
-        samples = model.guide(
+    # Now transform the unit hypercube to the prescribed distributions
+    # For each variable, transform with the inverse of the CDF (inv(CDF)=ppf)
+    for i, key in enumerate(keys):
+        dist_sample[:, i] = distributions[key].ppf(unif_sample[:, i])
+
+    # Save to CSV file using Pandas DataFrame and to_csv method
+    header = keys
+    # Convert to Pandas dataframe, append column headers, output as csv
+    df = pd.DataFrame(data=dist_sample, columns=header)
+    print(df)
+    for k, row in df.iterrows():
+        fs = row["f_snow"]
+        fi = row["f_ice"]
+        fr = row["f_refreeze"]
+
+        print("-------------------------------------------")
+        print("Variantional Inference of PDD parameters")
+        print("-------------------------------------------\n")
+        print("Trying to recover:")
+        print(f"f_snow={fs:.2f}, f_ice={fi:.2f}, f_refreeze={fr:.2f}\n")
+        print("-------------------------------------------")
+
+        if climate == "synth":
+            T_obs, P_obs, std_dev, A_obs, M_obs, R_obs, B_obs = load_synth_climate(
+                f_snow=fs, f_ice=fi, f_refreeze=fr, device=device
+            )
+        elif climate == "hirham":
+            T_obs, P_obs, std_dev, A_obs, M_obs, R_obs, B_obs = load_hirham_climate(
+                f_snow=fs, f_ice=fi, f_refreeze=fr, device=device
+            )
+        else:
+            print(f"Climate {climate} not recognized")
+
+        print(A_obs.mean(), M_obs.mean(), R_obs.mean())
+        normalize = False
+        # Normalization does not seem to improve convergence
+        if normalize:
+            T_obs = (T_obs - T_obs.mean()) / T_obs.std()
+            P_obs = (P_obs - P_obs.mean()) / P_obs.std()
+            std_dev = torch.nan_to_num((std_dev - std_dev.mean()) / std_dev.std())
+
+        model = BayesianPDD(device=device, max_epochs=max_epochs)
+        loss = model.forward(
             T_obs,
             P_obs,
             std_dev,
+            A_obs=A_obs,
+            M_obs=M_obs,
+            R_obs=R_obs,
+        )
+        print("Recovered parameters")
+        for name, value in pyro.get_param_store().items():
+            print(name, f"""{pyro.param(name).data.cpu().numpy():.2f}""")
+
+        with pyro.plate("samples", T_obs.shape[1], dim=-1):
+            samples = model.guide(
+                T_obs,
+                P_obs,
+                std_dev,
+            )
+
+        f_snow_posterior = samples["f_snow"].detach().cpu().numpy()
+        f_ice_posterior = samples["f_ice"].detach().cpu().numpy()
+        f_refreeze_posterior = samples["f_refreeze"].detach().cpu().numpy()
+
+        import seaborn as sns
+        from scipy.stats import norm
+
+        fig, axs = plt.subplots(
+            1,
+            2,
+            figsize=[12.0, 4],
+        )
+        fig.subplots_adjust(hspace=0.1, wspace=0.05)
+
+        sns.histplot(
+            f_snow_posterior,
+            kde=True,
+            stat="density",
+            label="f_snow_posterior",
+            lw=0,
+            ax=axs[0],
+        )
+        sns.histplot(
+            f_ice_posterior,
+            kde=True,
+            stat="density",
+            label="f_ice_posterior",
+            lw=0,
+            color="orange",
+            ax=axs[0],
+        )
+        sns.histplot(
+            f_refreeze_posterior,
+            kde=True,
+            stat="density",
+            lw=0,
+            label="f_refreeze_posterior",
+            ax=axs[1],
+        )
+        x0 = np.arange(0, 16, 0.001)
+        x1 = np.arange(0, 1, 0.001)
+        axs[0].plot(x0, norm.pdf(x0, 3, 1.0), lw=2, ls="dotted", label="f_snow_prior")
+        axs[0].plot(
+            x0,
+            norm.pdf(x0, 8.0, 1.5),
+            color="orange",
+            lw=2,
+            ls="dotted",
+            label="f_ice_prior",
+        )
+        axs[1].plot(
+            x1, norm.pdf(x1, 0.5, 0.2), lw=2, ls="dotted", label="f_refreeze_prior"
         )
 
-    f_snow_posterior = samples["f_snow"].detach().cpu().numpy()
-    f_ice_posterior = samples["f_ice"].detach().cpu().numpy()
-    f_refreeze_posterior = samples["f_refreeze"].detach().cpu().numpy()
-
-    import seaborn as sns
-    from scipy.stats import norm
-
-    fig, axs = plt.subplots(
-        1,
-        2,
-        figsize=[12.0, 4],
-    )
-    fig.subplots_adjust(hspace=0.1, wspace=0.05)
-
-    sns.histplot(
-        f_snow_posterior,
-        kde=True,
-        stat="density",
-        label="f_snow_posterior",
-        lw=0,
-        ax=axs[0],
-    )
-    sns.histplot(
-        f_ice_posterior,
-        kde=True,
-        stat="density",
-        label="f_ice_posterior",
-        lw=0,
-        color="orange",
-        ax=axs[0],
-    )
-    sns.histplot(
-        f_refreeze_posterior,
-        kde=True,
-        stat="density",
-        lw=0,
-        label="f_refreeze_posterior",
-        ax=axs[1],
-    )
-    x0 = np.arange(0, 16, 0.001)
-    x1 = np.arange(0, 1, 0.001)
-    axs[0].plot(x0, norm.pdf(x0, 3, 1.0), lw=2, ls="dotted", label="f_snow_prior")
-    axs[0].plot(
-        x0,
-        norm.pdf(x0, 8.0, 1.5),
-        color="orange",
-        lw=2,
-        ls="dotted",
-        label="f_ice_prior",
-    )
-    axs[1].plot(x1, norm.pdf(x1, 0.5, 0.2), lw=2, ls="dotted", label="f_refreeze_prior")
-
-    if climate != "hirham":
-        axs[0].axvline(fs, lw=3, label="f_snow_true")
-        axs[0].axvline(fi, lw=3, color="orange", label="f_ice_true")
-        axs[1].axvline(fr, lw=3, label="f_refreeze_true")
-    axs[0].legend()
-    axs[1].legend()
-    fig.savefig(f"climate_{climate}_snow_{fs}_ice_{fi}_refreeze_{fr}.pdf")
+        if climate != "hirham":
+            axs[0].axvline(fs, lw=3, label="f_snow_true")
+            axs[0].axvline(fi, lw=3, color="orange", label="f_ice_true")
+            axs[1].axvline(fr, lw=3, label="f_refreeze_true")
+        axs[0].legend()
+        axs[1].legend()
+        fig.savefig(
+            f"climate_{climate}_snow_{fs}_ice_{fi}_refreeze_{fr}_epochs_{max_epochs}.pdf"
+        )
