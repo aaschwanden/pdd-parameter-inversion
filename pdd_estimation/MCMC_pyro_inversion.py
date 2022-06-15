@@ -610,13 +610,13 @@ class BayesianPDD(pyro.nn.module.PyroModule):
             pdd_factor_snow=f_snow,
             pdd_factor_ice=f_ice,
             refreeze_snow=f_refreeze,
-            refreeze_ice=f_refreeze,
+            refreeze_ice=0,
             device=self.device,
         )
         result = pdd_model.forward(temp, precip, std_dev)
         A = result["accu"]
         M = result["melt"]
-        R = result["refreeze"]
+        R = result["runoff"]
 
         with pyro.plate("obs", use_cuda=self.use_cuda):
 
@@ -769,12 +769,12 @@ def load_synth_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
         refreeze_ice=f_refreeze,
         device=device,
     )
-    std_dev = np.zeros_like(T_obs)
+    # std_dev = np.zeros_like(T_obs)
     result = pdd(T_obs, P_obs, std_dev)
 
     A_obs = result["accu"]
     M_obs = result["melt"]
-    R_obs = result["refreeze"]
+    R_obs = result["runoff"]
     B_obs = result["smb"]
 
     return (
@@ -799,15 +799,7 @@ def load_hirham_climate(f_snow=3, f_ice=8, f_refreeze=0, device="cpu"):
     ) = read_observation(thinning_factor=10)
 
     T_obs -= 273.15
-    pdd = TorchPDDModel(
-        pdd_factor_snow=f_snow,
-        pdd_factor_ice=f_ice,
-        refreeze_snow=f_refreeze,
-        refreeze_ice=f_refreeze,
-        devic=device,
-    )
     std_dev = np.zeros_like(T_obs)
-    result = pdd(T_obs, P_obs, std_dev)
 
     return (
         torch.from_numpy(T_obs).to(device),
@@ -883,7 +875,7 @@ if __name__ == "__main__":
     distributions = {
         "f_snow": uniform(loc=2.0, scale=3.0),
         "f_ice": uniform(loc=4, scale=8),
-        "f_refreeze": uniform(loc=0.0, scale=1.0),
+        "f_refreeze": uniform(loc=0, scale=1),
     }
 
     # Names of all the variables
@@ -906,7 +898,6 @@ if __name__ == "__main__":
     header = keys
     # Convert to Pandas dataframe, append column headers, output as csv
     df = pd.DataFrame(data=dist_sample, columns=header)
-    print(df)
     for k, row in df.iterrows():
         fs = row["f_snow"]
         fi = row["f_ice"]
@@ -930,8 +921,12 @@ if __name__ == "__main__":
         else:
             print(f"Climate {climate} not recognized")
 
-        print(A_obs.mean(), M_obs.mean(), R_obs.mean())
         normalize = False
+
+        A_obs += np.random.normal(0, 0.01, A_obs.shape)
+        M_obs += np.random.normal(0, 0.1, M_obs.shape)
+        R_obs += np.random.normal(0, 0.1, R_obs.shape)
+
         # Normalization does not seem to improve convergence
         if normalize:
             T_obs = (T_obs - T_obs.mean()) / T_obs.std()
@@ -957,6 +952,21 @@ if __name__ == "__main__":
                 P_obs,
                 std_dev,
             )
+
+        pdd = TorchPDDModel(
+            pdd_factor_snow=fs,
+            pdd_factor_ice=fi,
+            refreeze_snow=fr,
+            refreeze_ice=0,
+            device=device,
+        )
+        # std_dev = np.zeros_like(T_obs)
+        result = pdd(T_obs, P_obs, std_dev)
+
+        A = result["accu"]
+        M = result["melt"]
+        R = result["runoff"]
+        B = result["smb"]
 
         f_snow_posterior = samples["f_snow"].detach().cpu().numpy()
         f_ice_posterior = samples["f_ice"].detach().cpu().numpy()
@@ -1019,5 +1029,5 @@ if __name__ == "__main__":
         axs[0].legend()
         axs[1].legend()
         fig.savefig(
-            f"climate_{climate}_snow_{fs}_ice_{fi}_refreeze_{fr}_epochs_{max_epochs}.pdf"
+            f"climate_{climate}_snow_{fs:.2f}_ice_{fi:.2f}_refreeze_{fr:.2f}_epochs_{max_epochs}.pdf"
         )

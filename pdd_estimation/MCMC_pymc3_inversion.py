@@ -582,7 +582,7 @@ class PDD_MCMC:
 
         A = result["accu"]
         M = result["melt"]
-        R = result["refreeze"]
+        R = result["runoff"]
 
         return A, M, R
 
@@ -620,14 +620,14 @@ if __name__ == "__main__":
     RANDOM_SEED = 8927
     rng = np.random.default_rng(RANDOM_SEED)
 
-    draws = 10000
+    draws = 5000
     tune = 1000
     cores = 6
 
     # load observations
     # T_obs, P_obs, R_obs, A_obs, M_obs, B_obs = read_observation(thinning_factor=20)
 
-    n = 20
+    n = 10
     m = 12
 
     lx = ly = 750000
@@ -649,10 +649,10 @@ if __name__ == "__main__":
     P_obs = prec.reshape(m, -1)
     std_dev = stdv.reshape(m, -1)
     pdd = PDDModel(
-        pdd_factor_snow=3,
-        pdd_factor_ice=8,
-        refreeze_snow=0.0,
-        refreeze_ice=0.0,
+        pdd_factor_snow=2,
+        pdd_factor_ice=10,
+        refreeze_snow=0.6,
+        refreeze_ice=0.6,
     )
     # result = pdd(T_obs, P_obs, std_dev)
     T_obs_norm = (T_obs - T_obs.mean()) / T_obs.std()
@@ -662,7 +662,7 @@ if __name__ == "__main__":
     # B_obs = result["smb"]
     A_obs = result["accu"]
     M_obs = result["melt"]
-    R_obs = result["refreeze"]
+    R_obs = result["runoff"]
 
     # initialize the PDD melt model class
     const = dict()
@@ -674,7 +674,7 @@ if __name__ == "__main__":
         # ----> Mass balance Model (physical priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         f_snow_prior = pm.TruncatedNormal(
-            "f_snow", mu=4.0, sigma=1.0, lower=0.0, upper=8
+            "f_snow", mu=8.0, sigma=1.0, lower=0.0, upper=8
         )
         f_ice_prior = pm.TruncatedNormal(
             "f_ice", mu=8.0, sigma=1.5, lower=0.0, upper=16
@@ -686,9 +686,9 @@ if __name__ == "__main__":
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ----> Hyperparameters (likelihood related priors)
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        A_sigma = pm.Normal("A_sigma", 1, 0.2)
-        M_sigma = pm.Normal("M_sigma", 10, 2.0)
-        R_sigma = pm.Normal("R_sigma", 0.5, 0.1)
+        A_sigma = pm.HalfNormal("A_sigma", 2)
+        M_sigma = pm.HalfNormal("M_sigma", 5)
+        R_sigma = pm.HalfNormal("R_sigma", 5)
 
         sigma = tt.transpose(tt.stack([A_sigma, M_sigma, R_sigma]))
 
@@ -723,38 +723,27 @@ if __name__ == "__main__":
             ),
         )
 
-    # with model:
-    #     trace = pm.sample(
-    #         init="advi",
-    #         draws=draws,
-    #         tune=tune,
-    #         cores=cores,
-    #         target_accept=0.9,
-    #         return_inferencedata=True,
-    #     )
+    with model:
+        trace = pm.sample(
+            draws=draws,
+            tune=tune,
+            cores=cores,
+            target_accept=0.99,
+            return_inferencedata=True,
+        )
 
-    # axes = az.plot_trace(trace, ["f_snow", "f_ice", "f_refreeze"])
-    # fig = axes.ravel()[0].figure
-    # fig.savefig("nuts.pdf")
+    axes = az.plot_trace(trace, ["f_snow", "f_ice", "f_refreeze"])
+    fig = axes.ravel()[0].figure
+    fig.savefig("nuts.pdf")
 
     with model:
-        advi = pm.ADVI()
-        advi.approx.shared_params
-        tracker = pm.callbacks.Tracker(
-            mean=advi.approx.mean.eval,  # callable that returns mean
-            std=advi.approx.std.eval,  # callable that returns std
+        approx = pm.fit(
+            300,
+            method="svgd",
+            inf_kwargs=dict(n_particles=1000),
+            obj_optimizer=pm.sgd(learning_rate=0.01),
         )
-        approx = advi.fit(draws, callbacks=[tracker])
 
-    # with model:
-    #     approx = pm.fit(
-    #         draws,
-    #         method="svgd",
-    #         inf_kwargs=dict(n_particles=1000),
-    #         obj_optimizer=pm.sgd(learning_rate=0.01),
-    #     )
-    # means = approx.bij.rmap(approx.mean.eval())
-    # sds = approx.bij.rmap(approx.std.eval())
     import seaborn as sns
 
     from scipy import stats
@@ -762,7 +751,7 @@ if __name__ == "__main__":
     fig, axs = plt.subplots(
         1,
         2,
-        figsize=[12.0, 4],
+        figsize=[12.0, 8],
     )
     fig.subplots_adjust(hspace=0.1, wspace=0.05)
     sns.kdeplot(approx.sample(10000)["f_snow"], label="snow", ax=axs[0])
